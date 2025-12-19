@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OLV29 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.98
+// @version      2.99
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
@@ -44,12 +44,12 @@
     - div.inbox
 */
 
-console.log("OLV29 Auto-Reply AI Assistant v2.98 - check-window load auto enqueue");
+console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_ON_LOAD");
 
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "2.98";
+  const SCRIPT_VERSION = "2.99";
 
   // iframe 内では動かさない
   if (window.top !== window.self) {
@@ -143,7 +143,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.98 - check-window load auto enqueu
     const panelCount = document.querySelectorAll("#" + PANEL_ID).length;
 
     const summary = {
-      version: "2.98",
+      version: "2.99",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
@@ -333,11 +333,14 @@ console.log("OLV29 Auto-Reply AI Assistant v2.98 - check-window load auto enqueu
     }, true);
   }
 
+  // checkWindow 経由で enqueue されたかどうかのフラグ
+  let __checkWindowEnqueued = false;
+
   function checkWindowLoadAutoTrigger() {
     const params = new URLSearchParams(location.search);
     const chk = params.get("checknumber") || "";
-    if (!chk) return;
-    if (!window.opener) return;
+    if (!chk) return false;
+    if (!window.opener) return false;
     const key = getCheckWindowLoadKey();
     const now = Date.now();
 
@@ -350,7 +353,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.98 - check-window load auto enqueu
       const prevTab = String(prev?.tabId || "");
       if (prevTs && (now - prevTs) < OPEN_CHECK_TTL_MS && prevTab === TAB_ID) {
         console.log("[AutoTrigger] suppressed by TTL (same tab)", { key, ageMs: now - prevTs, TAB_ID });
-        return;
+        return false;
       }
     } catch (e) {
       // ignore parse errors
@@ -368,12 +371,20 @@ console.log("OLV29 Auto-Reply AI Assistant v2.98 - check-window load auto enqueu
     const myJobId = getMyJobId();
     const enqueued = enqueueJob(myJobId, location.href);
     if (enqueued) {
-      console.log("[AutoTrigger] enqueue requested", { jobId: myJobId });
-      setDiagStatus("auto: start", "#c084fc");
+      console.log("[AutoTrigger] checkWindow enqueue SUCCESS - bypassing AUTO_SEND_ON_LOAD guard", { jobId: myJobId });
+      setDiagStatus("auto: checkWindow", "#c084fc");
+      setStatus("処理中…", "#ffa94d");
       updateProgressFromQueue();
       checkAndProcessMyJob();
+      __checkWindowEnqueued = true;
+      return true;
     } else {
       console.log("[AutoTrigger] enqueue skipped", { reason: "exists or blocked", jobId: myJobId });
+      // 既にキューにある場合も処理を試みる
+      __checkWindowEnqueued = true;
+      setStatus("処理中…", "#ffa94d");
+      checkAndProcessMyJob();
+      return true;
     }
   }
 
@@ -2498,9 +2509,15 @@ console.log("OLV29 Auto-Reply AI Assistant v2.98 - check-window load auto enqueu
     // 既にキューにある自分のジョブをチェック
     checkAndProcessMyJob();
 
-    if (!AUTO_SEND_ON_LOAD) {
+    // checkWindow 経由で既に enqueue された場合はガードを回避
+    if (!AUTO_SEND_ON_LOAD && !__checkWindowEnqueued) {
       log("auto-send disabled: not enqueueing (manual send only)");
       setStatus("待機中", "#9aa");
+      return;
+    }
+    // checkWindow 経由の場合はここまで来てもOK（既に enqueue 済み）
+    if (__checkWindowEnqueued) {
+      log("checkWindow enqueue already done - continuing with dispatcher");
       return;
     }
 

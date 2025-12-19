@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.98
+// @version      2.99
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -31,7 +31,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.98 - autoguard + backup");
+console.log("MEM44 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_ON_LOAD");
 
 (() => {
   "use strict";
@@ -112,7 +112,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.98 - autoguard + backup");
   const QUEUE_LIMIT = 20; // allow up to 20 relay jobs
 
   // Align with OLV: expose SCRIPT_VERSION for diagnostics
-  const SCRIPT_VERSION = "2.98";
+  const SCRIPT_VERSION = "2.99";
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
@@ -128,7 +128,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.98 - autoguard + backup");
     const panelCount = document.querySelectorAll("#" + PANEL_ID).length;
 
     const summary = {
-      version: "2.98",
+      version: "2.99",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
@@ -328,11 +328,14 @@ console.log("MEM44 Auto-Reply AI Assistant v2.98 - autoguard + backup");
     }, true);
   }
 
+  // checkWindow 経由で enqueue されたかどうかのフラグ
+  let __checkWindowEnqueued = false;
+
   function checkWindowLoadAutoTrigger() {
     const params = new URLSearchParams(location.search);
     const chk = params.get("checknumber") || "";
-    if (!chk) return;
-    if (!window.opener) return;
+    if (!chk) return false;
+    if (!window.opener) return false;
     const key = getCheckWindowLoadKey();
     const now = Date.now();
 
@@ -345,7 +348,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.98 - autoguard + backup");
       const prevTab = String(prev?.tabId || "");
       if (prevTs && (now - prevTs) < OPEN_CHECK_TTL_MS && prevTab === TAB_ID) {
         console.log("[AutoTrigger] suppressed by TTL (same tab)", { key, ageMs: now - prevTs, TAB_ID });
-        return;
+        return false;
       }
     } catch (e) {
       // ignore parse errors
@@ -363,12 +366,20 @@ console.log("MEM44 Auto-Reply AI Assistant v2.98 - autoguard + backup");
     const myJobId = getMyJobId();
     const enqueued = enqueueJob(myJobId, location.href);
     if (enqueued) {
-      console.log("[AutoTrigger] enqueue requested", { jobId: myJobId });
-      setDiagStatus("auto: start", "#c084fc");
+      console.log("[AutoTrigger] checkWindow enqueue SUCCESS - bypassing AUTO_SEND_ON_LOAD guard", { jobId: myJobId });
+      setDiagStatus("auto: checkWindow", "#c084fc");
+      setStatus("処理中…", "#ffa94d");
       updateProgressFromQueue();
       checkAndProcessMyJob();
+      __checkWindowEnqueued = true;
+      return true;
     } else {
       console.log("[AutoTrigger] enqueue skipped", { reason: "exists or blocked", jobId: myJobId });
+      // 既にキューにある場合も処理を試みる
+      __checkWindowEnqueued = true;
+      setStatus("処理中…", "#ffa94d");
+      checkAndProcessMyJob();
+      return true;
     }
   }
 
@@ -2466,9 +2477,15 @@ console.log("MEM44 Auto-Reply AI Assistant v2.98 - autoguard + backup");
     // 既にキューにある自分のジョブをチェック
     checkAndProcessMyJob();
 
-    if (!AUTO_SEND_ON_LOAD) {
+    // checkWindow 経由で既に enqueue された場合はガードを回避
+    if (!AUTO_SEND_ON_LOAD && !__checkWindowEnqueued) {
       log("auto-send disabled: not enqueueing (manual send only)");
       setStatus("待機中", "#9aa");
+      return;
+    }
+    // checkWindow 経由の場合はここまで来てもOK（既に enqueue 済み）
+    if (__checkWindowEnqueued) {
+      log("checkWindow enqueue already done - continuing with dispatcher");
       return;
     }
 
