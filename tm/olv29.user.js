@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OLV29 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.99
+// @version      2.100
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
@@ -44,12 +44,12 @@
     - div.inbox
 */
 
-console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_ON_LOAD");
+console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with watchdog");
 
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "2.99";
+  const SCRIPT_VERSION = "2.100";
 
   // iframe 内では動かさない
   if (window.top !== window.self) {
@@ -121,13 +121,17 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
   const QUEUE_KEY = "chatops.queue.v1";
   const LOCK_KEY = "chatops.queue.lock.v1";
   const PROGRESS_KEY = "chatops.queue.progress.v1";
+  const DEFERRED_KEY = "chatops.deferred.v1";  // v2.100: 遅延登録用
   const LOCK_TTL_MS = 60_000;        // ロック TTL 60秒
   const HEARTBEAT_INTERVAL_MS = 15_000; // ハートビート 15秒
   const DISPATCH_INTERVAL_MS = 1_000;   // ディスパッチ間隔 1秒
+  const WATCHDOG_INTERVAL_MS = 10_000;  // v2.100: watchdog 10秒間隔
+  const WATCHDOG_STALE_MS = 60_000;     // v2.100: 60秒動きがなければ stale 判定
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired";
-  const QUEUE_LIMIT = 20; // allow up to 20 relay jobs
+  const QUEUE_LIMIT = 25;              // v2.100: キュー上限を 25 に拡張
+  const MAX_ACTIVE_JOBS = 20;          // v2.100: running + pending の制限
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
@@ -139,21 +143,28 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
     const q = getJSON(QUEUE_KEY) || {};
     const p = getJSON(PROGRESS_KEY) || {};
     const lock = getJSON(LOCK_KEY) || {};
+    const deferred = getJSON(DEFERRED_KEY) || [];
     const lockAgeMs = lock?.acquiredAt ? Date.now() - lock.acquiredAt : null;
     const panelCount = document.querySelectorAll("#" + PANEL_ID).length;
 
     const summary = {
-      version: "2.99",
+      version: "2.100",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
+      MAX_ACTIVE_JOBS,
       REQUEST_TIMEOUT,
       panelCount,
       queueLen: (q.items || []).length,
+      queueItems: (q.items || []).map(it => ({ jobId: it.jobId, status: it.status })),
+      deferredLen: deferred.length,
+      deferredJobs: deferred,
       progressCurrentJobId: p.currentJobId || null,
       progressRunning: p.running || 0,
+      progressLastActivity: p.lastActivity || null,
       lockOwnerId: lock.ownerId || null,
       lockAgeMs,
+      watchdogActive: !!__watchdogTimer,
       initGuard: {
         __olv29InitDone: typeof g.__olv29InitDone !== "undefined" ? g.__olv29InitDone : null,
         __olv29Initialized: typeof g.__olv29Initialized !== "undefined" ? g.__olv29Initialized : null,
@@ -165,7 +176,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
 
   g.__chatopsResetStateOlv29 = () => {
     let removed = 0;
-    const prefixes = ["autoFired::", "autoFired.", "chatops.queue.", "_auto_last_sig", "olv29_auto_last_sig"];
+    const prefixes = ["autoFired::", "autoFired.", "chatops.queue.", "chatops.deferred.", "_auto_last_sig", "olv29_auto_last_sig"];
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const key = localStorage.key(i);
       if (!key) continue;
@@ -174,7 +185,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
         removed++;
       }
     }
-    [QUEUE_KEY, LOCK_KEY, PROGRESS_KEY].forEach(k => {
+    [QUEUE_KEY, LOCK_KEY, PROGRESS_KEY, DEFERRED_KEY].forEach(k => {
       if (localStorage.getItem(k) !== null) {
         localStorage.removeItem(k);
         removed++;
@@ -185,9 +196,32 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
     inFlight = false;
     autoDebounceTimer = null;
     mutationObserverActive = false;
+    stopWatchdog();
     console.log("[OLV29][reset] removed keys:", removed);
     return removed;
   };
+
+  // v2.100: deferredJobs をドレイン（強制 enqueue）
+  g.__chatopsDrainDeferredJobsOlv29 = () => {
+    const deferred = getDeferredJobs();
+    if (deferred.length === 0) {
+      console.log("[OLV29][drainDeferred] no deferred jobs");
+      return 0;
+    }
+    console.log("[OLV29][drainDeferred] draining", deferred.length, "jobs");
+    let count = 0;
+    for (const job of deferred) {
+      const ok = enqueueJob(job.jobId, job.url, true); // force=true
+      if (ok) count++;
+    }
+    clearDeferredJobs();
+    console.log("[OLV29][drainDeferred] enqueued", count, "jobs");
+    return count;
+  };
+
+  // v2.100: watchdog タイマー
+  let __watchdogTimer = null;
+  let __lastProgressActivity = Date.now();
 
   // ===== Boot helpers (dispatcher / listeners / triggers) =====
   let __chatopsBooted = false;
@@ -368,10 +402,54 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
         checknumber: chk,
       },
     });
+    
     const myJobId = getMyJobId();
+    
+    // v2.100: 既存ジョブの状態を確認
+    const queue = getQueue();
+    const existingJob = queue.items.find(it => it.jobId === myJobId);
+    
+    if (existingJob) {
+      console.log("[AutoTrigger] job already exists:", myJobId, "status:", existingJob.status);
+      
+      if (existingJob.status === "done") {
+        // done の場合は何もしない（正常完了済み）
+        console.log("[AutoTrigger] job already done, skipping");
+        __checkWindowEnqueued = true;
+        setStatus("完了", "#22c55e");
+        return true;
+      }
+      
+      if (existingJob.status === "running") {
+        // running の場合は処理を待つ
+        console.log("[AutoTrigger] job is running, waiting...");
+        __checkWindowEnqueued = true;
+        setStatus("処理中…", "#ffa94d");
+        return true;
+      }
+      
+      if (existingJob.status === "failed") {
+        // failed の場合は pending に戻してリトライ
+        console.log("[AutoTrigger] job failed, resetting to pending for retry");
+        existingJob.status = "pending";
+        existingJob.nextAt = Date.now();
+        existingJob.updatedAt = Date.now();
+        setQueue(queue);
+        updateProgressFromQueue();
+      }
+      
+      // pending の場合はそのまま処理続行
+      __checkWindowEnqueued = true;
+      setStatus("処理中…", "#ffa94d");
+      setDiagStatus("auto: checkWindow (existing)", "#c084fc");
+      checkAndProcessMyJob();
+      return true;
+    }
+    
+    // 新規 enqueue を試みる
     const enqueued = enqueueJob(myJobId, location.href);
     if (enqueued) {
-      console.log("[AutoTrigger] checkWindow enqueue SUCCESS - bypassing AUTO_SEND_ON_LOAD guard", { jobId: myJobId });
+      console.log("[AutoTrigger] checkWindow enqueue SUCCESS", { jobId: myJobId });
       setDiagStatus("auto: checkWindow", "#c084fc");
       setStatus("処理中…", "#ffa94d");
       updateProgressFromQueue();
@@ -379,11 +457,20 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
       __checkWindowEnqueued = true;
       return true;
     } else {
-      console.log("[AutoTrigger] enqueue skipped", { reason: "exists or blocked", jobId: myJobId });
-      // 既にキューにある場合も処理を試みる
+      // v2.100: enqueue できなかった場合（queue too large or too many active）
+      // deferred に追加済みなので、ステータス表示を更新
+      const deferred = getDeferredJobs();
+      const inDeferred = deferred.some(j => j.jobId === myJobId);
+      if (inDeferred) {
+        console.log("[AutoTrigger] job added to deferred, waiting for queue space", { jobId: myJobId });
+        setDiagStatus("auto: deferred", "#f59e0b");
+        setStatus("後続待ち", "#f59e0b");
+      } else {
+        console.log("[AutoTrigger] enqueue failed for unknown reason", { jobId: myJobId });
+        setStatus("処理中…", "#ffa94d");
+      }
       __checkWindowEnqueued = true;
-      setStatus("処理中…", "#ffa94d");
-      checkAndProcessMyJob();
+      // dispatcher が動いていれば deferred が処理される
       return true;
     }
   }
@@ -429,18 +516,78 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
     }
   }
 
-  // ジョブ登録（二重登録防止）
-  function enqueueJob(jobId, url) {
-    const queue = getQueue();
-    if (queue.items.length >= QUEUE_LIMIT) {
-      console.log("[ChatOps] enqueue blocked: queue too large", { queueLen: queue.items.length });
+  // v2.100: deferredJobs 管理
+  function getDeferredJobs() {
+    try {
+      const raw = localStorage.getItem(DEFERRED_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  }
+  function setDeferredJobs(jobs) {
+    try {
+      localStorage.setItem(DEFERRED_KEY, JSON.stringify(jobs));
+    } catch (e) {
+      console.warn("[ChatOps] setDeferredJobs error:", e);
+    }
+  }
+  function addDeferredJob(jobId, url) {
+    const deferred = getDeferredJobs();
+    if (deferred.some(j => j.jobId === jobId)) {
+      console.log("[ChatOps] job already in deferred:", jobId);
       return false;
     }
+    deferred.push({ jobId, url, addedAt: Date.now() });
+    setDeferredJobs(deferred);
+    console.log("[ChatOps] added to deferred:", jobId, "deferredLen:", deferred.length);
+    return true;
+  }
+  function removeDeferredJob(jobId) {
+    const deferred = getDeferredJobs();
+    const filtered = deferred.filter(j => j.jobId !== jobId);
+    if (filtered.length !== deferred.length) {
+      setDeferredJobs(filtered);
+      return true;
+    }
+    return false;
+  }
+  function clearDeferredJobs() {
+    try { localStorage.removeItem(DEFERRED_KEY); } catch {}
+  }
+
+  // v2.100: アクティブジョブ数（running + pending）を取得
+  function getActiveJobCount() {
+    const queue = getQueue();
+    return queue.items.filter(it => it.status === "pending" || it.status === "running").length;
+  }
+
+  // ジョブ登録（二重登録防止）- v2.100: deferred 対応
+  function enqueueJob(jobId, url, force = false) {
+    const queue = getQueue();
+    
+    // 既に存在するか確認
     const exists = queue.items.find(it => it.jobId === jobId);
     if (exists) {
       console.log("[ChatOps] job already exists:", jobId, exists.status);
       return false;
     }
+
+    // v2.100: キュー上限チェック
+    if (queue.items.length >= QUEUE_LIMIT && !force) {
+      console.log("[ChatOps] enqueue blocked: queue too large", { queueLen: queue.items.length, QUEUE_LIMIT });
+      // deferred に追加
+      addDeferredJob(jobId, url);
+      return false;
+    }
+
+    // v2.100: アクティブジョブ数チェック
+    const activeCount = getActiveJobCount();
+    if (activeCount >= MAX_ACTIVE_JOBS && !force) {
+      console.log("[ChatOps] enqueue blocked: too many active jobs", { activeCount, MAX_ACTIVE_JOBS });
+      // deferred に追加
+      addDeferredJob(jobId, url);
+      return false;
+    }
+
     queue.items.push({
       jobId,
       url,
@@ -451,8 +598,12 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
       updatedAt: Date.now(),
     });
     setQueue(queue);
-    console.log("[ChatOps] enqueued:", jobId);
+    console.log("[ChatOps] enqueued:", jobId, "queueLen:", queue.items.length);
     updateProgressFromQueue();
+    
+    // deferred から削除（念のため）
+    removeDeferredJob(jobId);
+    
     return true;
   }
 
@@ -586,6 +737,10 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
         return;
       }
       const progress = getProgress();
+      
+      // v2.100: lastActivity を更新
+      __lastProgressActivity = Date.now();
+      
       // currentJobId が設定済みでまだ running なら待つ
       if (progress.currentJobId) {
         const queue = getQueue();
@@ -602,6 +757,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
       const next = queue.items.find(it => it.status === "pending" && (!it.nextAt || it.nextAt <= now));
       if (next) {
         progress.currentJobId = next.jobId;
+        progress.lastActivity = now; // v2.100: watchdog 用
         setProgress(progress);
         console.log("[Queue] dispatching job:", next.jobId);
         setTimeout(() => {
@@ -617,11 +773,135 @@ console.log("OLV29 Auto-Reply AI Assistant v2.99 - checkWindow bypass AUTO_SEND_
           progress.currentJobId = null;
           setProgress(progress);
         }
+        // v2.100: キューが空なら deferred をドレイン
+        drainDeferredJobsIfPossible();
+        // v2.100: 完全に終了したらクリーンアップ
+        cleanupIfAllDone();
       }
     };
 
     dispatch();
     dispatcherTimer = setInterval(dispatch, DISPATCH_INTERVAL_MS);
+    // v2.100: watchdog を開始
+    startWatchdog();
+  }
+
+  // v2.100: deferred jobs を空きがあれば enqueue
+  function drainDeferredJobsIfPossible() {
+    const deferred = getDeferredJobs();
+    if (deferred.length === 0) return;
+    
+    const queue = getQueue();
+    const activeCount = getActiveJobCount();
+    const availableSlots = Math.min(QUEUE_LIMIT - queue.items.length, MAX_ACTIVE_JOBS - activeCount);
+    
+    if (availableSlots <= 0) return;
+    
+    console.log("[Queue] draining deferred jobs, available slots:", availableSlots);
+    const toDrain = deferred.slice(0, availableSlots);
+    let drained = 0;
+    
+    for (const job of toDrain) {
+      const ok = enqueueJob(job.jobId, job.url, true); // force=true
+      if (ok) {
+        removeDeferredJob(job.jobId);
+        drained++;
+      }
+    }
+    
+    if (drained > 0) {
+      console.log("[Queue] drained", drained, "deferred jobs");
+    }
+  }
+
+  // v2.100: 完了後のクリーンアップ
+  function cleanupIfAllDone() {
+    const queue = getQueue();
+    const deferred = getDeferredJobs();
+    const pendingOrRunning = queue.items.filter(it => it.status === "pending" || it.status === "running").length;
+    
+    if (pendingOrRunning === 0 && deferred.length === 0) {
+      console.log("[Queue] all jobs done, cleaning up");
+      try { localStorage.removeItem(LOCK_KEY); } catch {}
+      try { localStorage.removeItem(PROGRESS_KEY); } catch {}
+      setStatus("待機中", "#9aa");
+      stopWatchdog();
+    }
+  }
+
+  // v2.100: Watchdog - stale lock 自動回復
+  function startWatchdog() {
+    if (__watchdogTimer) return;
+    console.log("[Watchdog] started");
+    
+    __watchdogTimer = setInterval(() => {
+      const progress = getProgress();
+      const queue = getQueue();
+      const now = Date.now();
+      
+      // running ジョブがあるか確認
+      const runningJobs = queue.items.filter(it => it.status === "running");
+      if (runningJobs.length === 0) {
+        __lastProgressActivity = now;
+        return;
+      }
+      
+      // lastActivity から WATCHDOG_STALE_MS 以上経過しているか
+      const lastActivity = progress.lastActivity || __lastProgressActivity;
+      const staleDuration = now - lastActivity;
+      
+      if (staleDuration > WATCHDOG_STALE_MS) {
+        console.warn("[Watchdog] stale lock detected! staleDuration:", staleDuration, "ms, running jobs:", runningJobs.length);
+        recoverStaleQueue();
+      }
+    }, WATCHDOG_INTERVAL_MS);
+  }
+
+  function stopWatchdog() {
+    if (__watchdogTimer) {
+      clearInterval(__watchdogTimer);
+      __watchdogTimer = null;
+      console.log("[Watchdog] stopped");
+    }
+  }
+
+  function recoverStaleQueue() {
+    console.log("[Watchdog] recovering stale queue...");
+    
+    // 1. running ジョブを pending に戻す
+    const queue = getQueue();
+    let recovered = 0;
+    for (const item of queue.items) {
+      if (item.status === "running") {
+        item.status = "pending";
+        item.tries = (item.tries || 0) + 1;
+        item.nextAt = Date.now() + 1000; // 1秒後に再試行
+        item.updatedAt = Date.now();
+        recovered++;
+      }
+    }
+    if (recovered > 0) {
+      setQueue(queue);
+      console.log("[Watchdog] recovered", recovered, "stale jobs");
+    }
+    
+    // 2. lock と progress をクリア
+    try { localStorage.removeItem(LOCK_KEY); } catch {}
+    try { localStorage.removeItem(PROGRESS_KEY); } catch {}
+    
+    // 3. progress を再設定
+    setProgress({ currentJobId: null, total: 0, done: 0, running: 0, failed: 0, remaining: 0, lastActivity: Date.now() });
+    __lastProgressActivity = Date.now();
+    
+    // 4. dispatcher を再起動
+    if (dispatcherTimer) {
+      clearInterval(dispatcherTimer);
+      dispatcherTimer = null;
+    }
+    console.log("[Watchdog] restarting dispatcher...");
+    setTimeout(() => startDispatcher(true), 500);
+    
+    console.log("[Watchdog] recovered stale queue");
   }
 
   // ワーカー: currentJobId が自分の jobId なら処理
