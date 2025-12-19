@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OLV29 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.101
+// @version      2.102
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
@@ -44,12 +44,12 @@
     - div.inbox
 */
 
-console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain");
+console.log("OLV29 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher");
 
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "2.101";
+  const SCRIPT_VERSION = "2.102";
 
   // iframe 内では動かさない
   if (window.top !== window.self) {
@@ -122,11 +122,14 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
   const LOCK_KEY = "chatops.queue.lock.v1";
   const PROGRESS_KEY = "chatops.queue.progress.v1";
   const DEFERRED_KEY = "chatops.deferred.v1";  // v2.100: 遅延登録用
+  const TABREG_KEY = "chatops.tabs.v1";        // v2.102: オープンタブ・レジストリ
   const LOCK_TTL_MS = 60_000;        // ロック TTL 60秒
   const HEARTBEAT_INTERVAL_MS = 15_000; // ハートビート 15秒
   const DISPATCH_INTERVAL_MS = 1_000;   // ディスパッチ間隔 1秒
   const WATCHDOG_INTERVAL_MS = 10_000;  // v2.100: watchdog 10秒間隔
   const WATCHDOG_STALE_MS = 60_000;     // v2.100: 60秒動きがなければ stale 判定
+  const TABREG_TTL_MS = 30_000;         // v2.102: 30秒更新なしで死亡扱い
+  const TABREG_HEARTBEAT_MS = 10_000;   // v2.102: 10秒ごとにタブ登録更新
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired";
@@ -144,19 +147,31 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
     const p = getJSON(PROGRESS_KEY) || {};
     const lock = getJSON(LOCK_KEY) || {};
     const deferred = getJSON(DEFERRED_KEY) || [];
+    const rawTabReg = getJSON(TABREG_KEY) || { version: 1, tabs: {} };
+    const tabReg = pruneTabRegistry(rawTabReg);
     const lockAgeMs = lock?.acquiredAt ? Date.now() - lock.acquiredAt : null;
     const panelCount = document.querySelectorAll("#" + PANEL_ID).length;
+    const myJobId = getMyJobId();
+    const pendingJobs = (q.items || []).filter(it => it.status === "pending");
 
     const summary = {
-      version: "2.101",
+      version: "2.102",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
       MAX_ACTIVE_JOBS,
       REQUEST_TIMEOUT,
       panelCount,
+      // v2.102: タブ情報
+      tabId: TAB_ID,
+      myJobId,
+      isMyJobOpen: isJobOpenSomewhere(myJobId),
+      tabRegistry: tabReg,
+      openTabCount: Object.keys(tabReg.tabs).length,
+      // キュー情報
       queueLen: (q.items || []).length,
       queueItems: (q.items || []).map(it => ({ jobId: it.jobId, status: it.status })),
+      pendingCount: pendingJobs.length,
       deferredLen: deferred.length,
       deferredJobs: deferred,
       progressCurrentJobId: p.currentJobId || null,
@@ -165,6 +180,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
       lockOwnerId: lock.ownerId || null,
       lockAgeMs,
       watchdogActive: !!__watchdogTimer,
+      tabRegHeartbeatActive: !!__tabRegHeartbeatTimer,
       initGuard: {
         __olv29InitDone: typeof g.__olv29InitDone !== "undefined" ? g.__olv29InitDone : null,
         __olv29Initialized: typeof g.__olv29Initialized !== "undefined" ? g.__olv29Initialized : null,
@@ -176,7 +192,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
 
   g.__chatopsResetStateOlv29 = () => {
     let removed = 0;
-    const prefixes = ["autoFired::", "autoFired.", "chatops.queue.", "chatops.deferred.", "_auto_last_sig", "olv29_auto_last_sig"];
+    const prefixes = ["autoFired::", "autoFired.", "chatops.queue.", "chatops.deferred.", "chatops.tabs.", "_auto_last_sig", "olv29_auto_last_sig"];
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const key = localStorage.key(i);
       if (!key) continue;
@@ -185,7 +201,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
         removed++;
       }
     }
-    [QUEUE_KEY, LOCK_KEY, PROGRESS_KEY, DEFERRED_KEY].forEach(k => {
+    [QUEUE_KEY, LOCK_KEY, PROGRESS_KEY, DEFERRED_KEY, TABREG_KEY].forEach(k => {
       if (localStorage.getItem(k) !== null) {
         localStorage.removeItem(k);
         removed++;
@@ -230,6 +246,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
     __chatopsBooted = true;
     try { pruneQueueIfTooLarge(); } catch (e) { console.warn("[OLV29] bootQueue pruneQueueIfTooLarge failed", e); }
     try { setupStorageListener(); } catch (e) { console.warn("[OLV29] bootQueue setupStorageListener failed", e); }
+    try { startTabRegistryHeartbeat(); } catch (e) { console.warn("[OLV29] bootQueue startTabRegistryHeartbeat failed", e); }
     try { startDispatcher(true); } catch (e) { console.warn("[OLV29] bootQueue startDispatcher failed", e); }
     try { initOpenCheckClickListener(); } catch (e) { console.warn("[OLV29] bootQueue initOpenCheckClickListener failed", e); }
     try { checkWindowLoadAutoTrigger(); } catch (e) { console.warn("[OLV29] bootQueue checkWindowLoadAutoTrigger failed", e); }
@@ -246,6 +263,101 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
     }
     return id;
   })();
+
+  // ========== v2.102: オープンタブ・レジストリ ==========
+  // dispatcher が「開いているタブの jobId」だけを選べるようにする
+  
+  function getTabRegistry() {
+    try {
+      const raw = localStorage.getItem(TABREG_KEY);
+      if (!raw) return { version: 1, tabs: {} };
+      const reg = JSON.parse(raw);
+      if (reg.version !== 1) return { version: 1, tabs: {} };
+      return reg;
+    } catch { return { version: 1, tabs: {} }; }
+  }
+
+  function setTabRegistry(reg) {
+    try {
+      localStorage.setItem(TABREG_KEY, JSON.stringify(reg));
+    } catch (e) {
+      console.warn("[TabReg] setTabRegistry error:", e);
+    }
+  }
+
+  function upsertMyTabRegistry() {
+    try {
+      const reg = getTabRegistry();
+      const myJobId = getMyJobId();
+      reg.tabs[TAB_ID] = {
+        jobId: myJobId,
+        href: location.href,
+        ts: Date.now(),
+      };
+      setTabRegistry(reg);
+      console.log("[TabReg] upsert:", TAB_ID, "jobId:", myJobId);
+    } catch (e) {
+      console.warn("[TabReg] upsertMyTabRegistry error:", e);
+    }
+  }
+
+  function removeMyTabRegistry() {
+    try {
+      const reg = getTabRegistry();
+      if (reg.tabs[TAB_ID]) {
+        delete reg.tabs[TAB_ID];
+        setTabRegistry(reg);
+        console.log("[TabReg] removed:", TAB_ID);
+      }
+    } catch (e) {
+      console.warn("[TabReg] removeMyTabRegistry error:", e);
+    }
+  }
+
+  function pruneTabRegistry(reg) {
+    const now = Date.now();
+    const pruned = { version: 1, tabs: {} };
+    for (const [tabId, entry] of Object.entries(reg.tabs || {})) {
+      if (entry.ts && (now - entry.ts) < TABREG_TTL_MS) {
+        pruned.tabs[tabId] = entry;
+      }
+    }
+    return pruned;
+  }
+
+  function isJobOpenSomewhere(jobId) {
+    const reg = pruneTabRegistry(getTabRegistry());
+    for (const entry of Object.values(reg.tabs)) {
+      if (entry.jobId === jobId) return true;
+    }
+    return false;
+  }
+
+  let __tabRegHeartbeatTimer = null;
+  function startTabRegistryHeartbeat() {
+    if (__tabRegHeartbeatTimer) return;
+    
+    // 初回登録
+    upsertMyTabRegistry();
+    
+    // 定期更新
+    __tabRegHeartbeatTimer = setInterval(() => {
+      upsertMyTabRegistry();
+    }, TABREG_HEARTBEAT_MS);
+    
+    // visibilitychange で復帰時に即更新
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        upsertMyTabRegistry();
+      }
+    });
+    
+    // beforeunload / unload で自分の entry を削除
+    window.addEventListener("beforeunload", removeMyTabRegistry);
+    window.addEventListener("unload", removeMyTabRegistry);
+    
+    console.log("[TabReg] heartbeat started, interval:", TABREG_HEARTBEAT_MS);
+  }
 
   // このタブの jobId（URL から安定キー生成）
   // URLパラメータを複数候補から取得するヘルパー
@@ -375,6 +487,11 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
     const chk = params.get("checknumber") || "";
     if (!chk) return false;
     if (!window.opener) return false;
+    
+    // v2.102: タブレジストリに即時登録（dispatcher が選べるようにする）
+    try { upsertMyTabRegistry(); } catch (e) { console.warn("[AutoTrigger] upsertMyTabRegistry error:", e); }
+    setTimeout(() => { try { upsertMyTabRegistry(); } catch {} }, 500); // 初期DOM遅延対策
+    
     const key = getCheckWindowLoadKey();
     const now = Date.now();
 
@@ -751,15 +868,26 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
         // done/failed なら次へ
         progress.currentJobId = null;
       }
-      // 次の pending を探す
+      // 次の pending を探す（v2.102: オープン中のタブの jobId のみ対象）
       const queue = getQueue();
       const now = Date.now();
-      const next = queue.items.find(it => it.status === "pending" && (!it.nextAt || it.nextAt <= now));
+      
+      // v2.102: タブレジストリを prune して保存
+      const reg = pruneTabRegistry(getTabRegistry());
+      setTabRegistry(reg);
+      
+      // v2.102: pending かつ nextAt が来ていて、かつ開いているタブがある jobId のみ
+      const next = queue.items.find(it => 
+        it.status === "pending" 
+        && (!it.nextAt || it.nextAt <= now)
+        && isJobOpenSomewhere(it.jobId)
+      );
+      
       if (next) {
         progress.currentJobId = next.jobId;
         progress.lastActivity = now; // v2.100: watchdog 用
         setProgress(progress);
-        console.log("[Queue] dispatching job:", next.jobId);
+        console.log("[Queue] dispatching job:", next.jobId, "(tab open)");
         setTimeout(() => {
           try {
             checkAndProcessMyJob();
@@ -768,7 +896,17 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
           }
         }, 0);
       } else {
-        // 全部終わり
+        // v2.102: pending があるが open tab がない場合は詰まり検知ログ
+        const pendingJobs = queue.items.filter(it => it.status === "pending");
+        if (pendingJobs.length > 0) {
+          const openTabCount = Object.keys(reg.tabs).length;
+          console.log("[Queue] pending exists but no open tab for jobs", { 
+            pendingCount: pendingJobs.length, 
+            openTabCount,
+            pendingJobIds: pendingJobs.slice(0, 5).map(it => it.jobId),
+          });
+        }
+        // 全部終わり or 開いているタブがない
         if (progress.currentJobId) {
           progress.currentJobId = null;
           setProgress(progress);
@@ -789,7 +927,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
   // v2.100: deferred jobs を空きがあれば enqueue（1件ずつ安全に）
   function drainDeferredJobsIfPossible() {
     console.log("[Drain] start");
-    
+
     const deferred = getDeferredJobs();
     if (deferred.length === 0) {
       console.log("[Drain] done (no deferred jobs)");
@@ -804,7 +942,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain")
 
     const queue = getQueue();
     const activeCount = getActiveJobCount();
-    
+
     // 空きがなければ待つ
     if (queue.items.length >= QUEUE_LIMIT || activeCount >= MAX_ACTIVE_JOBS) {
       console.log("[Drain] skipped (no slots)", { queueLen: queue.items.length, activeCount });
