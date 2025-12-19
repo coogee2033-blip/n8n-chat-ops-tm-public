@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.92
+// @version      2.94
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -31,7 +31,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.91 - autoguard + backup");
+${1}2.94 - autoguard + backup");
 
 (() => {
   "use strict";
@@ -1415,7 +1415,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.91 - autoguard + backup");
     // デバッグログ
     const maleCount = all.filter((m) => m.speaker === "male").length;
     const femaleCount = all.filter((m) => m.speaker === "female").length;
-    console.log("[MEM44 v2.5] scrapeConversationStructured:", {
+    ${1}2.94] scrapeConversationStructured:", {
       total: all.length,
       male: maleCount,
       female: femaleCount,
@@ -2203,7 +2203,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.91 - autoguard + backup");
     const timestampMs = now.getTime();
 
     // デバッグ用ログ
-    console.log("[MEM44 v2.5] buildWebhookPayload:", {
+    ${1}2.94] buildWebhookPayload:", {
       blueStage,
       conv6Count: conv6.length,
       conv20Count: conv20.length,
@@ -2267,7 +2267,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.91 - autoguard + backup");
     }
     try {
       const payload = await buildWebhookPayload();
-      console.log("[MEM44 v2.5] sending payload to n8n:", payload.timestamp, payload);
+      ${1}2.94] sending payload to n8n:", payload.timestamp, payload);
       const res = await sendToN8n(payload);
       if (!res) return;
       // reply_formatted を優先使用（文頭制御・疑問文化・改行整形済み）

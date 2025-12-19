@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OLV29 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.92
+// @version      2.94
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
@@ -44,12 +44,12 @@
     - div.inbox
 */
 
-console.log("OLV29 Auto-Reply AI Assistant v2.88 - check-window load auto enqueue");
+${1}2.94 - check-window load auto enqueue");
 
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "2.85";
+  const SCRIPT_VERSION = "2.94";
 
   // iframe 内では動かさない
   if (window.top !== window.self) {
@@ -1429,7 +1429,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.88 - check-window load auto enqueu
     // デバッグログ
     const maleCount = all.filter((m) => m.speaker === "male").length;
     const femaleCount = all.filter((m) => m.speaker === "female").length;
-    console.log("[OLV29 v1.8] scrapeConversationStructured:", {
+    ${1}2.94] scrapeConversationStructured:", {
       total: all.length,
       male: maleCount,
       female: femaleCount,
@@ -2221,7 +2221,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.88 - check-window load auto enqueu
     const timestampMs = now.getTime();
 
     // デバッグ用ログ
-    console.log("[OLV29 v1.8] buildWebhookPayload:", {
+    ${1}2.94] buildWebhookPayload:", {
       blueStage,
       conv6Count: conv6.length,
       conv20Count: conv20.length,
