@@ -5,8 +5,8 @@
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
-// @downloadURL  https://raw.githubusercontent.com/coogee2033-blip/n8n-chat-ops-tm-public/tm-v2.90/tm/olv29.user.js
-// @updateURL    https://raw.githubusercontent.com/coogee2033-blip/n8n-chat-ops-tm-public/tm-v2.90/tm/olv29.user.js
+// @downloadURL  https://raw.githubusercontent.com/coogee2033-blip/n8n-chat-ops-tm-public/tm-v2.94/tm/olv29.user.js
+// @updateURL    https://raw.githubusercontent.com/coogee2033-blip/n8n-chat-ops-tm-public/tm-v2.94/tm/olv29.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
