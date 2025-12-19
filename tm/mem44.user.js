@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.94
+// @version      2.98
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -31,7 +31,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-${1}2.94 - autoguard + backup");
+console.log("MEM44 Auto-Reply AI Assistant v2.98 - autoguard + backup");
 
 (() => {
   "use strict";
@@ -62,13 +62,13 @@ ${1}2.94 - autoguard + backup");
   );
   const PANEL_ID = "datingops-ai-panel";
   const AUTO_SEND_ON_LOAD = false;  // open-check押下でのみ自動送信
-  const AUTO_SEND_ON_NEW_MALE = false;
+  const AUTO_SEND_ON_NEW_MALE = true;
   const SHOW_QUEUE_STATUS = false; // C4: キュー表示を抑止（true にすると表示）
   const LOAD_DELAY_MS = 600;
   const RETRY_READ_CHAT = 3;
   const RETRY_READ_GAP = 250;
   const DUP_WINDOW_MS = 10_000;
-  const REQUEST_TIMEOUT = 45_000; // webhook送信の最大待ち時間
+  const REQUEST_TIMEOUT = 120_000; // webhook送信の最大待ち時間（2分）
   const diagState = {
     lastRequestAt: "-",
     lastResult: "-",
@@ -109,11 +109,84 @@ ${1}2.94 - autoguard + backup");
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired.v2.86";
-  const QUEUE_LIMIT = 5;
+  const QUEUE_LIMIT = 20; // allow up to 20 relay jobs
+
+  // Align with OLV: expose SCRIPT_VERSION for diagnostics
+  const SCRIPT_VERSION = "2.98";
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
   const OPEN_CHECK_TTL_MS = 10_000;
+
+  // ===== Debug / Reset (console callable) =====
+  g.__chatopsDebugMem44 = () => {
+    const getJSON = (k) => { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch { return null; } };
+    const q = getJSON("chatops.queue.v1") || {};
+    const p = getJSON("chatops.queue.progress.v1") || {};
+    const lock = getJSON("chatops.queue.lock.v1") || {};
+    const lockAgeMs = lock?.acquiredAt ? Date.now() - lock.acquiredAt : null;
+    const panelCount = document.querySelectorAll("#" + PANEL_ID).length;
+
+    const summary = {
+      version: "2.98",
+      SCRIPT_VERSION,
+      AUTO_SEND_ON_NEW_MALE,
+      QUEUE_LIMIT,
+      REQUEST_TIMEOUT,
+      panelCount,
+      queueLen: (q.items || []).length,
+      progressCurrentJobId: p.currentJobId || null,
+      progressRunning: p.running || 0,
+      lockOwnerId: lock.ownerId || null,
+      lockAgeMs,
+      initGuard: {
+        __datingOpsInitDone: typeof g.__datingOpsInitDone !== "undefined" ? g.__datingOpsInitDone : null,
+        __datingOpsInitialized: typeof g.__datingOpsInitialized !== "undefined" ? g.__datingOpsInitialized : null,
+      },
+    };
+    console.log("[MEM44][diag]", summary);
+    return summary;
+  };
+
+  g.__chatopsResetStateMem44 = () => {
+    let removed = 0;
+    const prefixes = ["autoFired::", "autoFired.", "chatops.queue.", "_auto_last_sig", "mem44_auto_last_sig"];
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i);
+      if (!key) continue;
+      if (prefixes.some(p => key.includes(p))) {
+        localStorage.removeItem(key);
+        removed++;
+      }
+    }
+    ["chatops.queue.v1", "chatops.queue.lock.v1", "chatops.queue.progress.v1"].forEach(k => {
+      if (localStorage.getItem(k) !== null) {
+        localStorage.removeItem(k);
+        removed++;
+      }
+    });
+    // reset in-memory flags
+    workerActive = false;
+    inFlight = false;
+    autoDebounceTimer = null;
+    mutationObserverActive = false;
+    console.log("[MEM44][reset] removed keys:", removed);
+    return removed;
+  };
+
+  // ===== Boot helpers (dispatcher / listeners / triggers) =====
+  let __chatopsBooted = false;
+  function bootQueueOnce() {
+    if (__chatopsBooted) return;
+    __chatopsBooted = true;
+    try { pruneQueueIfTooLarge(); } catch (e) { console.warn("[MEM44] bootQueue pruneQueueIfTooLarge failed", e); }
+    try { setupStorageListener(); } catch (e) { console.warn("[MEM44] bootQueue setupStorageListener failed", e); }
+    try { startDispatcher(true); } catch (e) { console.warn("[MEM44] bootQueue startDispatcher failed", e); }
+    try { initOpenCheckClickListener(); } catch (e) { console.warn("[MEM44] bootQueue initOpenCheckClickListener failed", e); }
+    try { checkWindowLoadAutoTrigger(); } catch (e) { console.warn("[MEM44] bootQueue checkWindowLoadAutoTrigger failed", e); }
+  }
+
+  g.__chatopsBootQueueMem44 = bootQueueOnce;
 
   // タブ固有ID（セッション単位）
   const TAB_ID = (() => {
@@ -1415,7 +1488,7 @@ ${1}2.94 - autoguard + backup");
     // デバッグログ
     const maleCount = all.filter((m) => m.speaker === "male").length;
     const femaleCount = all.filter((m) => m.speaker === "female").length;
-    ${1}2.94] scrapeConversationStructured:", {
+    console.log("[MEM44] scrapeConversationStructured:", {
       total: all.length,
       male: maleCount,
       female: femaleCount,
@@ -2203,7 +2276,7 @@ ${1}2.94 - autoguard + backup");
     const timestampMs = now.getTime();
 
     // デバッグ用ログ
-    ${1}2.94] buildWebhookPayload:", {
+    console.log("[MEM44] buildWebhookPayload:", {
       blueStage,
       conv6Count: conv6.length,
       conv20Count: conv20.length,
@@ -2267,7 +2340,7 @@ ${1}2.94 - autoguard + backup");
     }
     try {
       const payload = await buildWebhookPayload();
-      ${1}2.94] sending payload to n8n:", payload.timestamp, payload);
+      console.log("[MEM44] sending payload to n8n:", payload.timestamp, payload);
       const res = await sendToN8n(payload);
       if (!res) return;
       // reply_formatted を優先使用（文頭制御・疑問文化・改行整形済み）
