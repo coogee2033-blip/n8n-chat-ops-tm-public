@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OLV29 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.100
+// @version      2.101
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
@@ -44,12 +44,12 @@
     - div.inbox
 */
 
-console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with watchdog");
+console.log("OLV29 Auto-Reply AI Assistant v2.101 - safe 1-by-1 deferred drain");
 
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "2.100";
+  const SCRIPT_VERSION = "2.101";
 
   // iframe 内では動かさない
   if (window.top !== window.self) {
@@ -148,7 +148,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
     const panelCount = document.querySelectorAll("#" + PANEL_ID).length;
 
     const summary = {
-      version: "2.100",
+      version: "2.101",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
@@ -402,16 +402,16 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
         checknumber: chk,
       },
     });
-    
+
     const myJobId = getMyJobId();
-    
+
     // v2.100: 既存ジョブの状態を確認
     const queue = getQueue();
     const existingJob = queue.items.find(it => it.jobId === myJobId);
-    
+
     if (existingJob) {
       console.log("[AutoTrigger] job already exists:", myJobId, "status:", existingJob.status);
-      
+
       if (existingJob.status === "done") {
         // done の場合は何もしない（正常完了済み）
         console.log("[AutoTrigger] job already done, skipping");
@@ -419,7 +419,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
         setStatus("完了", "#22c55e");
         return true;
       }
-      
+
       if (existingJob.status === "running") {
         // running の場合は処理を待つ
         console.log("[AutoTrigger] job is running, waiting...");
@@ -427,7 +427,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
         setStatus("処理中…", "#ffa94d");
         return true;
       }
-      
+
       if (existingJob.status === "failed") {
         // failed の場合は pending に戻してリトライ
         console.log("[AutoTrigger] job failed, resetting to pending for retry");
@@ -437,7 +437,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
         setQueue(queue);
         updateProgressFromQueue();
       }
-      
+
       // pending の場合はそのまま処理続行
       __checkWindowEnqueued = true;
       setStatus("処理中…", "#ffa94d");
@@ -445,7 +445,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
       checkAndProcessMyJob();
       return true;
     }
-    
+
     // 新規 enqueue を試みる
     const enqueued = enqueueJob(myJobId, location.href);
     if (enqueued) {
@@ -563,7 +563,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
   // ジョブ登録（二重登録防止）- v2.100: deferred 対応
   function enqueueJob(jobId, url, force = false) {
     const queue = getQueue();
-    
+
     // 既に存在するか確認
     const exists = queue.items.find(it => it.jobId === jobId);
     if (exists) {
@@ -600,10 +600,10 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
     setQueue(queue);
     console.log("[ChatOps] enqueued:", jobId, "queueLen:", queue.items.length);
     updateProgressFromQueue();
-    
+
     // deferred から削除（念のため）
     removeDeferredJob(jobId);
-    
+
     return true;
   }
 
@@ -737,10 +737,10 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
         return;
       }
       const progress = getProgress();
-      
+
       // v2.100: lastActivity を更新
       __lastProgressActivity = Date.now();
-      
+
       // currentJobId が設定済みでまだ running なら待つ
       if (progress.currentJobId) {
         const queue = getQueue();
@@ -786,31 +786,45 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
     startWatchdog();
   }
 
-  // v2.100: deferred jobs を空きがあれば enqueue
+  // v2.100: deferred jobs を空きがあれば enqueue（1件ずつ安全に）
   function drainDeferredJobsIfPossible() {
-    const deferred = getDeferredJobs();
-    if (deferred.length === 0) return;
+    console.log("[Drain] start");
     
+    const deferred = getDeferredJobs();
+    if (deferred.length === 0) {
+      console.log("[Drain] done (no deferred jobs)");
+      return;
+    }
+
+    // キューがビジーなら待つ
+    if (workerActive || inFlight) {
+      console.log("[Drain] skipped (queue busy)", { workerActive, inFlight });
+      return;
+    }
+
     const queue = getQueue();
     const activeCount = getActiveJobCount();
-    const availableSlots = Math.min(QUEUE_LIMIT - queue.items.length, MAX_ACTIVE_JOBS - activeCount);
     
-    if (availableSlots <= 0) return;
-    
-    console.log("[Queue] draining deferred jobs, available slots:", availableSlots);
-    const toDrain = deferred.slice(0, availableSlots);
-    let drained = 0;
-    
-    for (const job of toDrain) {
-      const ok = enqueueJob(job.jobId, job.url, true); // force=true
-      if (ok) {
-        removeDeferredJob(job.jobId);
-        drained++;
-      }
+    // 空きがなければ待つ
+    if (queue.items.length >= QUEUE_LIMIT || activeCount >= MAX_ACTIVE_JOBS) {
+      console.log("[Drain] skipped (no slots)", { queueLen: queue.items.length, activeCount });
+      return;
     }
-    
-    if (drained > 0) {
-      console.log("[Queue] drained", drained, "deferred jobs");
+
+    // 1件だけ取り出して enqueue
+    const job = deferred[0];
+    if (!job) {
+      console.log("[Drain] done (no deferred jobs)");
+      return;
+    }
+
+    const ok = enqueueJob(job.jobId, job.url, true); // force=true
+    if (ok) {
+      removeDeferredJob(job.jobId);
+      const remaining = getDeferredJobs().length;
+      console.log("[Drain] enqueue 1 job, remain=" + remaining, { jobId: job.jobId });
+    } else {
+      console.log("[Drain] enqueue failed", { jobId: job.jobId });
     }
   }
 
@@ -819,7 +833,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
     const queue = getQueue();
     const deferred = getDeferredJobs();
     const pendingOrRunning = queue.items.filter(it => it.status === "pending" || it.status === "running").length;
-    
+
     if (pendingOrRunning === 0 && deferred.length === 0) {
       console.log("[Queue] all jobs done, cleaning up");
       try { localStorage.removeItem(LOCK_KEY); } catch {}
@@ -833,23 +847,23 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
   function startWatchdog() {
     if (__watchdogTimer) return;
     console.log("[Watchdog] started");
-    
+
     __watchdogTimer = setInterval(() => {
       const progress = getProgress();
       const queue = getQueue();
       const now = Date.now();
-      
+
       // running ジョブがあるか確認
       const runningJobs = queue.items.filter(it => it.status === "running");
       if (runningJobs.length === 0) {
         __lastProgressActivity = now;
         return;
       }
-      
+
       // lastActivity から WATCHDOG_STALE_MS 以上経過しているか
       const lastActivity = progress.lastActivity || __lastProgressActivity;
       const staleDuration = now - lastActivity;
-      
+
       if (staleDuration > WATCHDOG_STALE_MS) {
         console.warn("[Watchdog] stale lock detected! staleDuration:", staleDuration, "ms, running jobs:", runningJobs.length);
         recoverStaleQueue();
@@ -867,7 +881,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
 
   function recoverStaleQueue() {
     console.log("[Watchdog] recovering stale queue...");
-    
+
     // 1. running ジョブを pending に戻す
     const queue = getQueue();
     let recovered = 0;
@@ -884,15 +898,15 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
       setQueue(queue);
       console.log("[Watchdog] recovered", recovered, "stale jobs");
     }
-    
+
     // 2. lock と progress をクリア
     try { localStorage.removeItem(LOCK_KEY); } catch {}
     try { localStorage.removeItem(PROGRESS_KEY); } catch {}
-    
+
     // 3. progress を再設定
     setProgress({ currentJobId: null, total: 0, done: 0, running: 0, failed: 0, remaining: 0, lastActivity: Date.now() });
     __lastProgressActivity = Date.now();
-    
+
     // 4. dispatcher を再起動
     if (dispatcherTimer) {
       clearInterval(dispatcherTimer);
@@ -900,7 +914,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.100 - stable 20-queue batch with w
     }
     console.log("[Watchdog] restarting dispatcher...");
     setTimeout(() => startDispatcher(true), 500);
-    
+
     console.log("[Watchdog] recovered stale queue");
   }
 
