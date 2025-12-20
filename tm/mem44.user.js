@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.102
+// @version      2.103
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -31,7 +31,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher");
+console.log("MEM44 Auto-Reply AI Assistant v2.103 - extended tab registry TTL");
 
 (() => {
   "use strict";
@@ -110,8 +110,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher"
   const DISPATCH_INTERVAL_MS = 1_000;   // ディスパッチ間隔 1秒
   const WATCHDOG_INTERVAL_MS = 10_000;  // v2.100: watchdog 10秒間隔
   const WATCHDOG_STALE_MS = 60_000;     // v2.100: 60秒動きがなければ stale 判定
-  const TABREG_TTL_MS = 30_000;         // v2.102: 30秒更新なしで死亡扱い
-  const TABREG_HEARTBEAT_MS = 10_000;   // v2.102: 10秒ごとにタブ登録更新
+  const TABREG_TTL_MS = 300_000;        // v2.103: 5分更新なしで死亡扱い（バックグラウンド対策）
+  const TABREG_HEARTBEAT_MS = 30_000;   // v2.103: 30秒ごとにタブ登録更新
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired.v2.86";
@@ -119,7 +119,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher"
   const MAX_ACTIVE_JOBS = 20;          // v2.100: running + pending の制限
 
   // Align with OLV: expose SCRIPT_VERSION for diagnostics
-  const SCRIPT_VERSION = "2.102";
+  const SCRIPT_VERSION = "2.103";
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
@@ -140,7 +140,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher"
     const pendingJobs = (q.items || []).filter(it => it.status === "pending");
 
     const summary = {
-      version: "2.102",
+      version: "2.103",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
@@ -251,7 +251,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher"
 
   // ========== v2.102: オープンタブ・レジストリ ==========
   // dispatcher が「開いているタブの jobId」だけを選べるようにする
-  
+
   function getTabRegistry() {
     try {
       const raw = localStorage.getItem(TABREG_KEY);
@@ -321,26 +321,26 @@ console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher"
   let __tabRegHeartbeatTimer = null;
   function startTabRegistryHeartbeat() {
     if (__tabRegHeartbeatTimer) return;
-    
+
     // 初回登録
     upsertMyTabRegistry();
-    
+
     // 定期更新
     __tabRegHeartbeatTimer = setInterval(() => {
       upsertMyTabRegistry();
     }, TABREG_HEARTBEAT_MS);
-    
+
     // visibilitychange で復帰時に即更新
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
         upsertMyTabRegistry();
       }
     });
-    
+
     // beforeunload / unload で自分の entry を削除
     window.addEventListener("beforeunload", removeMyTabRegistry);
     window.addEventListener("unload", removeMyTabRegistry);
-    
+
     console.log("[TabReg] heartbeat started, interval:", TABREG_HEARTBEAT_MS);
   }
 
@@ -482,11 +482,11 @@ console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher"
     const chk = params.get("checknumber") || "";
     if (!chk) return false;
     if (!window.opener) return false;
-    
+
     // v2.102: タブレジストリに即時登録（dispatcher が選べるようにする）
     try { upsertMyTabRegistry(); } catch (e) { console.warn("[AutoTrigger] upsertMyTabRegistry error:", e); }
     setTimeout(() => { try { upsertMyTabRegistry(); } catch {} }, 500); // 初期DOM遅延対策
-    
+
     const key = getCheckWindowLoadKey();
     const now = Date.now();
 
@@ -870,18 +870,17 @@ console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher"
       // 次の pending を探す（v2.102: オープン中のタブの jobId のみ対象）
       const queue = getQueue();
       const now = Date.now();
-      
-      // v2.102: タブレジストリを prune して保存
+
+      // v2.103: タブレジストリを prune（保存は heartbeat 側が担う）
       const reg = pruneTabRegistry(getTabRegistry());
-      setTabRegistry(reg);
-      
+
       // v2.102: pending かつ nextAt が来ていて、かつ開いているタブがある jobId のみ
-      const next = queue.items.find(it => 
-        it.status === "pending" 
+      const next = queue.items.find(it =>
+        it.status === "pending"
         && (!it.nextAt || it.nextAt <= now)
         && isJobOpenSomewhere(it.jobId)
       );
-      
+
       if (next) {
         progress.currentJobId = next.jobId;
         progress.lastActivity = now; // v2.100: watchdog 用
@@ -902,8 +901,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.102 - tab registry for dispatcher"
         const pendingJobs = queue.items.filter(it => it.status === "pending");
         if (pendingJobs.length > 0) {
           const openTabCount = Object.keys(reg.tabs).length;
-          console.log("[Queue] pending exists but no open tab for jobs", { 
-            pendingCount: pendingJobs.length, 
+          console.log("[Queue] pending exists but no open tab for jobs", {
+            pendingCount: pendingJobs.length,
             openTabCount,
             pendingJobIds: pendingJobs.slice(0, 5).map(it => it.jobId),
           });
