@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.104
+// @version      2.106
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -31,7 +31,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
+console.log("MEM44 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan recovery");
 
 (() => {
   "use strict";
@@ -104,7 +104,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
   const LOCK_KEY = "chatops.queue.lock.v1";
   const PROGRESS_KEY = "chatops.queue.progress.v1";
   const DEFERRED_KEY = "chatops.deferred.v1";  // v2.100: 遅延登録用
-  const TABREG_KEY = "chatops.tabs.v1";        // v2.102: オープンタブ・レジストリ
+  const TABREG_KEY = "chatops.tabreg.v1";      // v2.102: オープンタブ・レジストリ（olv/mem 共通キー）
+  const TABREG_KEY_OLD = "chatops.tabs.v1";    // 旧キー互換（v2.102系）
   const LOCK_TTL_MS = 60_000;        // ロック TTL 60秒
   const HEARTBEAT_INTERVAL_MS = 15_000; // ハートビート 15秒
   const DISPATCH_INTERVAL_MS = 1_000;   // ディスパッチ間隔 1秒
@@ -113,6 +114,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
   const TABREG_TTL_MS = 300_000;        // v2.103: 5分更新なしで死亡扱い（バックグラウンド対策）
   const TABREG_HEARTBEAT_MS = 30_000;   // v2.103: 30秒ごとにタブ登録更新
   const ORPHAN_PENDING_TTL_MS = 120_000; // v2.104: 開いているタブが無い pending を自動掃除する猶予（2分）
+  const ORPHAN_RUNNING_TTL_MS = 120_000; // v2.106: 開いているタブが無い running を自動回復する猶予（2分）
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired.v2.86";
@@ -120,7 +122,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
   const MAX_ACTIVE_JOBS = 20;          // v2.100: running + pending の制限
 
   // Align with OLV: expose SCRIPT_VERSION for diagnostics
-  const SCRIPT_VERSION = "2.104";
+  const SCRIPT_VERSION = "2.106";
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
@@ -141,7 +143,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
     const pendingJobs = (q.items || []).filter(it => it.status === "pending");
 
     const summary = {
-      version: "2.104",
+      version: "2.106",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
@@ -178,7 +180,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
 
   g.__chatopsResetStateMem44 = () => {
     let removed = 0;
-    const prefixes = ["autoFired::", "autoFired.", "chatops.queue.", "chatops.deferred.", "chatops.tabs.", "_auto_last_sig", "mem44_auto_last_sig"];
+    const prefixes = ["autoFired::", "autoFired.", "chatops.queue.", "chatops.deferred.", "chatops.tabs.", "chatops.tabreg.", "_auto_last_sig", "mem44_auto_last_sig"];
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const key = localStorage.key(i);
       if (!key) continue;
@@ -232,11 +234,30 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
     __chatopsBooted = true;
     try { pruneQueueIfTooLarge(); } catch (e) { console.warn("[MEM44] bootQueue pruneQueueIfTooLarge failed", e); }
     try { setupStorageListener(); } catch (e) { console.warn("[MEM44] bootQueue setupStorageListener failed", e); }
+    try { migrateTabRegistryKey(); } catch (e) { console.warn("[MEM44] bootQueue migrateTabRegistryKey failed", e); }
     try { startTabRegistryHeartbeat(); } catch (e) { console.warn("[MEM44] bootQueue startTabRegistryHeartbeat failed", e); }
     try { startDispatcher(true); } catch (e) { console.warn("[MEM44] bootQueue startDispatcher failed", e); }
     try { initOpenCheckClickListener(); } catch (e) { console.warn("[MEM44] bootQueue initOpenCheckClickListener failed", e); }
     try { checkWindowLoadAutoTrigger(); } catch (e) { console.warn("[MEM44] bootQueue checkWindowLoadAutoTrigger failed", e); }
   }
+  // v2.105: TABREG キー互換（olv/mem のキー不一致で「open tab が無い」扱いになり全停止する事故を防ぐ）
+  function migrateTabRegistryKey() {
+    try {
+      const cur = localStorage.getItem(TABREG_KEY);
+      const old = localStorage.getItem(TABREG_KEY_OLD);
+      // 新が無くて旧がある場合は移行
+      if (!cur && old) {
+        localStorage.setItem(TABREG_KEY, old);
+      }
+      // 常に旧キーを掃除（両方存在しても新を正として使う）
+      if (old) {
+        localStorage.removeItem(TABREG_KEY_OLD);
+      }
+    } catch (e) {
+      console.warn("[TabReg] migrateTabRegistryKey error:", e);
+    }
+  }
+// ========== v2.102: オープンタブ・レジストリ ==========
 
   g.__chatopsBootQueueMem44 = bootQueueOnce;
 
@@ -669,12 +690,13 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
     try { localStorage.removeItem(DEFERRED_KEY); } catch {}
   }
 
-  // v2.104: アクティブジョブ数（running + 「開いているタブがある pending」）を取得
-  // 目的: 閉じられたタブ由来の pending が残っても、新規ジョブが永久に deferred にならないようにする
+  // v2.105: アクティブジョブ数（開いているタブがあるものだけ）
+  // - running でもタブが閉じられていたら孤児扱いにしてカウントしない
+  // - pending は「開いているタブがある pending」のみカウント
   function getActiveJobCount() {
     const queue = getQueue();
     return queue.items.filter(it =>
-      it.status === "running" ||
+      (it.status === "running" && isJobOpenSomewhere(it.jobId)) ||
       (it.status === "pending" && isJobOpenSomewhere(it.jobId))
     ).length;
   }
@@ -705,6 +727,43 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
     }
 
     return removed;
+  }
+
+  // v2.105: 開いているタブが無い running を掃除（クラッシュ/強制終了/タイムアウト対策）
+  // 方針: ORPHAN_RUNNING_TTL_MS 経過した running を pending に戻して再ディスパッチ可能にする。
+  function pruneOrphanRunningJobs() {
+    const queue = getQueue();
+    const now = Date.now();
+    let recovered = 0;
+
+    for (const it of (queue.items || [])) {
+      if (it.status === "running" && !isJobOpenSomewhere(it.jobId)) {
+        const age = now - (it.updatedAt || it.nextAt || now);
+        if (age >= ORPHAN_RUNNING_TTL_MS) {
+          it.status = "pending";
+          it.nextAt = now + 1000; // すぐ再試行
+          it.updatedAt = now;
+          it.lastError = it.lastError || "orphan running recovered";
+          recovered++;
+        }
+      }
+    }
+
+    if (recovered > 0) {
+      setQueue(queue);
+      // currentJobId が孤児だった場合もクリア
+      try {
+        const prog = getProgress();
+        if (prog?.currentJobId && !isJobOpenSomewhere(prog.currentJobId)) {
+          prog.currentJobId = null;
+          setProgress(prog);
+        }
+      } catch {}
+      updateProgressFromQueue();
+      console.warn("[Queue] recovered orphan running jobs", { recovered });
+    }
+
+    return recovered;
   }
 
   // ジョブ登録（二重登録防止）- v2.100: deferred 対応
@@ -894,11 +953,16 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
       if (progress.currentJobId) {
         const queue = getQueue();
         const current = queue.items.find(it => it.jobId === progress.currentJobId);
-        if (current && current.status === "running") {
+
+        // v2.105: currentJobId が孤児（タブが無い）なら即クリアして詰まり回避
+        if (progress.currentJobId && !isJobOpenSomewhere(progress.currentJobId)) {
+          progress.currentJobId = null;
+        } else if (current && current.status === "running") {
           return; // 処理中
+        } else {
+          // done/failed/存在しない → 次へ
+          progress.currentJobId = null;
         }
-        // done/failed なら次へ
-        progress.currentJobId = null;
       }
       // 次の pending を探す（v2.102: オープン中のタブの jobId のみ対象）
       const queue = getQueue();
@@ -941,6 +1005,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
           });
           // v2.104: 開いているタブが無い pending を掃除して詰まりを解除
           pruneOrphanPendingJobs();
+          // v2.105: running 側も孤児回復
+          pruneOrphanRunningJobs();
         }
         // 全部終わり or 開いているタブがない
         if (progress.currentJobId) {
