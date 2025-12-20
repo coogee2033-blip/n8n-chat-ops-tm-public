@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.103
+// @version      2.104
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -31,7 +31,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.103 - extended tab registry TTL");
+console.log("MEM44 Auto-Reply AI Assistant v2.104 - orphan pending prune");
 
 (() => {
   "use strict";
@@ -112,6 +112,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.103 - extended tab registry TTL");
   const WATCHDOG_STALE_MS = 60_000;     // v2.100: 60秒動きがなければ stale 判定
   const TABREG_TTL_MS = 300_000;        // v2.103: 5分更新なしで死亡扱い（バックグラウンド対策）
   const TABREG_HEARTBEAT_MS = 30_000;   // v2.103: 30秒ごとにタブ登録更新
+  const ORPHAN_PENDING_TTL_MS = 120_000; // v2.104: 開いているタブが無い pending を自動掃除する猶予（2分）
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired.v2.86";
@@ -119,7 +120,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.103 - extended tab registry TTL");
   const MAX_ACTIVE_JOBS = 20;          // v2.100: running + pending の制限
 
   // Align with OLV: expose SCRIPT_VERSION for diagnostics
-  const SCRIPT_VERSION = "2.103";
+  const SCRIPT_VERSION = "2.104";
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
@@ -140,7 +141,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.103 - extended tab registry TTL");
     const pendingJobs = (q.items || []).filter(it => it.status === "pending");
 
     const summary = {
-      version: "2.103",
+      version: "2.104",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
@@ -668,10 +669,42 @@ console.log("MEM44 Auto-Reply AI Assistant v2.103 - extended tab registry TTL");
     try { localStorage.removeItem(DEFERRED_KEY); } catch {}
   }
 
-  // v2.100: アクティブジョブ数（running + pending）を取得
+  // v2.104: アクティブジョブ数（running + 「開いているタブがある pending」）を取得
+  // 目的: 閉じられたタブ由来の pending が残っても、新規ジョブが永久に deferred にならないようにする
   function getActiveJobCount() {
     const queue = getQueue();
-    return queue.items.filter(it => it.status === "pending" || it.status === "running").length;
+    return queue.items.filter(it =>
+      it.status === "running" ||
+      (it.status === "pending" && isJobOpenSomewhere(it.jobId))
+    ).length;
+  }
+
+  // v2.104: 開いているタブが無い pending を掃除（タブレジストリ方式の副作用対策）
+  function pruneOrphanPendingJobs() {
+    const queue = getQueue();
+    const now = Date.now();
+    let removed = 0;
+
+    const keep = [];
+    for (const it of (queue.items || [])) {
+      if (it.status === "pending" && !isJobOpenSomewhere(it.jobId)) {
+        const age = now - (it.updatedAt || it.nextAt || now);
+        if (age >= ORPHAN_PENDING_TTL_MS) {
+          removed++;
+          continue;
+        }
+      }
+      keep.push(it);
+    }
+
+    if (removed > 0) {
+      queue.items = keep;
+      setQueue(queue);
+      updateProgressFromQueue();
+      console.warn("[Queue] pruned orphan pending jobs", { removed });
+    }
+
+    return removed;
   }
 
   // ジョブ登録（二重登録防止）- v2.100: deferred 対応
@@ -906,6 +939,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.103 - extended tab registry TTL");
             openTabCount,
             pendingJobIds: pendingJobs.slice(0, 5).map(it => it.jobId),
           });
+          // v2.104: 開いているタブが無い pending を掃除して詰まりを解除
+          pruneOrphanPendingJobs();
         }
         // 全部終わり or 開いているタブがない
         if (progress.currentJobId) {
