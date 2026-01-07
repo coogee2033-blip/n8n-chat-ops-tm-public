@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OLV29 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.106
+// @version      2.109
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
@@ -21,7 +21,8 @@
 // ==/UserScript==
 
 // NOTE: このスクリプトは GitHub raw からインストール・更新される想定です。
-// Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください。
+// Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください
+// v2.109: domGate hardening (readyState + chatRoot) + payload/response validation hardening (empty reply調査用)
 
 /*
   === OLV29 専用 Tampermonkey スクリプト ===
@@ -44,12 +45,12 @@
     - div.inbox
 */
 
-console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan recovery");
+console.log("OLV29 Auto-Reply AI Assistant v2.109 - tabreg key unify + orphan recovery + dom gate");
 
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "2.106";
+  const SCRIPT_VERSION = "2.109";
 
   // iframe 内では動かさない
   if (window.top !== window.self) {
@@ -132,7 +133,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
   const TABREG_TTL_MS = 300_000;        // v2.103: 5分更新なしで死亡扱い（バックグラウンド対策）
   const TABREG_HEARTBEAT_MS = 30_000;   // v2.103: 30秒ごとにタブ登録更新
   const ORPHAN_PENDING_TTL_MS = 120_000; // v2.104: 開いているタブが無い pending を自動掃除する猶予（2分）
-  const ORPHAN_RUNNING_TTL_MS = 120_000; // v2.106: 開いているタブが無い running を自動回復する猶予（2分）
+  const ORPHAN_RUNNING_TTL_MS = 120_000; // v2.107: 開いているタブが無い running を自動回復する猶予（2分）
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired";
@@ -158,7 +159,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
     const pendingJobs = (q.items || []).filter(it => it.status === "pending");
 
     const summary = {
-      version: "2.106",
+      version: "2.107",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
@@ -256,7 +257,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
     try { checkWindowLoadAutoTrigger(); } catch (e) { console.warn("[OLV29] bootQueue checkWindowLoadAutoTrigger failed", e); }
   }
 
-  // v2.106: TABREG キー互換（olv/mem のキー不一致で「open tab が無い」扱いになり全停止する事故を防ぐ）
+  // v2.107: TABREG キー互換（olv/mem のキー不一致で「open tab が無い」扱いになり全停止する事故を防ぐ）
   function migrateTabRegistryKey() {
     try {
       const cur = localStorage.getItem(TABREG_KEY);
@@ -693,7 +694,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
     try { localStorage.removeItem(DEFERRED_KEY); } catch {}
   }
 
-  // v2.106: アクティブジョブ数（開いているタブがあるものだけ）
+  // v2.107: アクティブジョブ数（開いているタブがあるものだけ）
   // - running でもタブが閉じられていたら孤児扱いにしてカウントしない
   // - pending は「開いているタブがある pending」のみカウント
   function getActiveJobCount() {
@@ -732,7 +733,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
     return removed;
   }
 
-  // v2.106: 開いているタブが無い running を掃除（クラッシュ/強制終了/タイムアウト対策）
+  // v2.107: 開いているタブが無い running を掃除（クラッシュ/強制終了/タイムアウト対策）
   // 方針: ORPHAN_RUNNING_TTL_MS 経過した running を pending に戻して再ディスパッチ可能にする。
   function pruneOrphanRunningJobs() {
     const queue = getQueue();
@@ -955,7 +956,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
         const queue = getQueue();
         const current = queue.items.find(it => it.jobId === progress.currentJobId);
 
-        // v2.106: currentJobId が孤児（タブが無い）なら即クリアして詰まり回避
+        // v2.107: currentJobId が孤児（タブが無い）なら即クリアして詰まり回避
         if (progress.currentJobId && !isJobOpenSomewhere(progress.currentJobId)) {
           progress.currentJobId = null;
         } else if (current && current.status === "running") {
@@ -1003,7 +1004,7 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
           });
           // v2.104: 開いているタブが無い pending を掃除して詰まりを解除
           pruneOrphanPendingJobs();
-          // v2.106: running 側も孤児回復
+          // v2.107: running 側も孤児回復
           pruneOrphanRunningJobs();
         }
         // 全部終わり or 開いているタブがない
@@ -3096,8 +3097,86 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
     }, 500);
   }
 
-  /** ===== Main ===== */
-  (async function init() {
+    /** ===== DOM Ready Gate ===== */
+  function waitForDomReadyGate(initFn, label = "OLV29") {
+    let started = false;
+    let fired = false;
+    const pollMs = 300;
+    const timeoutMs = 20000;
+
+    const cleanup = (observer, intervalId) => {
+      if (intervalId) clearInterval(intervalId);
+      if (observer) observer.disconnect();
+    };
+
+    const snapshot = () => {
+      const root = getChatRoot() || document;
+      return {
+        readyState: document.readyState,
+        textareaCount: root.querySelectorAll("textarea").length,
+        formCount: root.querySelectorAll("form").length,
+        iframeCount: document.querySelectorAll("iframe").length,
+        personalRootOk: !!getChatRoot(),
+      };
+    };
+
+    const tryReady = (observer, intervalId) => {
+      if (fired) return;
+      const snap = snapshot();
+      const ok =
+        snap.readyState === "complete" &&
+        snap.textareaCount > 0 &&
+        snap.formCount > 0 &&
+        snap.personalRootOk;
+      if (!ok) return;
+      fired = true;
+      cleanup(observer, intervalId);
+      console.log(`[${label}] domGate ready`, {
+        readyState: snap.readyState,
+        textareaCount: snap.textareaCount,
+        formCount: snap.formCount,
+        iframeCount: snap.iframeCount,
+      });
+      Promise.resolve()
+        .then(() => initFn && initFn())
+        .catch((e) => console.warn(`[${label}] domGate init error`, e));
+    };
+
+    const root = document.body || document.documentElement;
+    const observer = new MutationObserver(() => tryReady(observer, intervalId));
+    if (root) observer.observe(root, { childList: true, subtree: true });
+    const intervalId = setInterval(() => tryReady(observer, intervalId), pollMs);
+
+    setTimeout(() => {
+      if (!fired) {
+        const snap = snapshot();
+        console.warn(`[${label}] domGate timeout`, {
+          readyState: snap.readyState,
+          textareaCount: snap.textareaCount,
+          formCount: snap.formCount,
+          iframeCount: snap.iframeCount,
+        });
+        if (intervalId) clearInterval(intervalId);
+        // observer remains to catch late DOM appearance
+      }
+    }, timeoutMs);
+
+    if (!started) {
+      started = true;
+      const snap = snapshot();
+      console.log(`[${label}] domGate start`, {
+        readyState: snap.readyState,
+        textareaCount: snap.textareaCount,
+        formCount: snap.formCount,
+        iframeCount: snap.iframeCount,
+      });
+    }
+
+    tryReady(observer, intervalId);
+  }
+
+/** ===== Main ===== */
+  async function init() {
     console.log("[OLV29] init() called - starting initialization...");
 
     if (!isPersonalSendPage()) {
@@ -3132,6 +3211,8 @@ console.log("OLV29 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
 
     mountAuto();
     log("ready.");
-  })();
+  }
+
+  waitForDomReadyGate(() => init(), "OLV29");
 })();
 

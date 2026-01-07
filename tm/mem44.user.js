@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.106
+// @version      2.109
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -21,7 +21,8 @@
 // ==/UserScript==
 
 // NOTE: このスクリプトは GitHub raw からインストール・更新される想定です。
-// Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください。
+// Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください
+// v2.109: domGate hardening (readyState + chatRoot) + payload/response validation hardening (empty reply調査用)
 
 /*
   === mem44 専用 Tampermonkey スクリプト ===
@@ -31,7 +32,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan recovery");
+console.log("MEM44 Auto-Reply AI Assistant v2.109 - tabreg key unify + orphan recovery + dom gate");
 
 (() => {
   "use strict";
@@ -114,7 +115,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
   const TABREG_TTL_MS = 300_000;        // v2.103: 5分更新なしで死亡扱い（バックグラウンド対策）
   const TABREG_HEARTBEAT_MS = 30_000;   // v2.103: 30秒ごとにタブ登録更新
   const ORPHAN_PENDING_TTL_MS = 120_000; // v2.104: 開いているタブが無い pending を自動掃除する猶予（2分）
-  const ORPHAN_RUNNING_TTL_MS = 120_000; // v2.106: 開いているタブが無い running を自動回復する猶予（2分）
+  const ORPHAN_RUNNING_TTL_MS = 120_000; // v2.107: 開いているタブが無い running を自動回復する猶予（2分）
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired.v2.86";
@@ -122,7 +123,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
   const MAX_ACTIVE_JOBS = 20;          // v2.100: running + pending の制限
 
   // Align with OLV: expose SCRIPT_VERSION for diagnostics
-  const SCRIPT_VERSION = "2.106";
+  const SCRIPT_VERSION = "2.107";
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
@@ -143,7 +144,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
     const pendingJobs = (q.items || []).filter(it => it.status === "pending");
 
     const summary = {
-      version: "2.106",
+      version: "2.107",
       SCRIPT_VERSION,
       AUTO_SEND_ON_NEW_MALE,
       QUEUE_LIMIT,
@@ -3061,8 +3062,86 @@ console.log("MEM44 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
     }, 500);
   }
 
-  /** ===== Main ===== */
-  (async function init() {
+    /** ===== DOM Ready Gate ===== */
+  function waitForDomReadyGate(initFn, label = "MEM44") {
+    let started = false;
+    let fired = false;
+    const pollMs = 300;
+    const timeoutMs = 20000;
+
+    const cleanup = (observer, intervalId) => {
+      if (intervalId) clearInterval(intervalId);
+      if (observer) observer.disconnect();
+    };
+
+    const snapshot = () => {
+      const root = getChatRoot() || document;
+      return {
+        readyState: document.readyState,
+        textareaCount: root.querySelectorAll("textarea").length,
+        formCount: root.querySelectorAll("form").length,
+        iframeCount: document.querySelectorAll("iframe").length,
+        personalRootOk: !!getChatRoot(),
+      };
+    };
+
+    const tryReady = (observer, intervalId) => {
+      if (fired) return;
+      const snap = snapshot();
+      const ok =
+        snap.readyState === "complete" &&
+        snap.textareaCount > 0 &&
+        snap.formCount > 0 &&
+        snap.personalRootOk;
+      if (!ok) return;
+      fired = true;
+      cleanup(observer, intervalId);
+      console.log(`[${label}] domGate ready`, {
+        readyState: snap.readyState,
+        textareaCount: snap.textareaCount,
+        formCount: snap.formCount,
+        iframeCount: snap.iframeCount,
+      });
+      Promise.resolve()
+        .then(() => initFn && initFn())
+        .catch((e) => console.warn(`[${label}] domGate init error`, e));
+    };
+
+    const root = document.body || document.documentElement;
+    const observer = new MutationObserver(() => tryReady(observer, intervalId));
+    if (root) observer.observe(root, { childList: true, subtree: true });
+    const intervalId = setInterval(() => tryReady(observer, intervalId), pollMs);
+
+    setTimeout(() => {
+      if (!fired) {
+        const snap = snapshot();
+        console.warn(`[${label}] domGate timeout`, {
+          readyState: snap.readyState,
+          textareaCount: snap.textareaCount,
+          formCount: snap.formCount,
+          iframeCount: snap.iframeCount,
+        });
+        if (intervalId) clearInterval(intervalId);
+        // observer remains to catch late DOM appearance
+      }
+    }, timeoutMs);
+
+    if (!started) {
+      started = true;
+      const snap = snapshot();
+      console.log(`[${label}] domGate start`, {
+        readyState: snap.readyState,
+        textareaCount: snap.textareaCount,
+        formCount: snap.formCount,
+        iframeCount: snap.iframeCount,
+      });
+    }
+
+    tryReady(observer, intervalId);
+  }
+
+/** ===== Main ===== */
+  async function init() {
     if (!isPersonalSendPage()) {
       log("skip: not personalbox");
       return;
@@ -3094,5 +3173,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.106 - tabreg key unify + orphan re
 
     mountAuto();
     log("ready.");
-  })();
+  }
+
+  waitForDomReadyGate(() => init(), "MEM44");
 })();
