@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OLV29 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.109
+// @version      2.110
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
@@ -22,7 +22,7 @@
 
 // NOTE: このスクリプトは GitHub raw からインストール・更新される想定です。
 // Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください
-// v2.109: domGate hardening (readyState + chatRoot) + payload/response validation hardening (empty reply調査用)
+// v2.110: domGate allow interactive + input detection hardening
 
 /*
   === OLV29 専用 Tampermonkey スクリプト ===
@@ -45,12 +45,12 @@
     - div.inbox
 */
 
-console.log("OLV29 Auto-Reply AI Assistant v2.109 - tabreg key unify + orphan recovery + dom gate");
+console.log("OLV29 Auto-Reply AI Assistant v2.110 - tabreg key unify + orphan recovery + dom gate");
 
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "2.109";
+  const SCRIPT_VERSION = "2.110";
 
   // iframe 内では動かさない
   if (window.top !== window.self) {
@@ -3114,9 +3114,10 @@ console.log("OLV29 Auto-Reply AI Assistant v2.109 - tabreg key unify + orphan re
       return {
         readyState: document.readyState,
         textareaCount: root.querySelectorAll("textarea").length,
+        editableCount: root.querySelectorAll('[contenteditable="true"]').length,
         formCount: root.querySelectorAll("form").length,
         iframeCount: document.querySelectorAll("iframe").length,
-        personalRootOk: !!getChatRoot(),
+        hasChatRoot: !!getChatRoot(),
       };
     };
 
@@ -3124,18 +3125,19 @@ console.log("OLV29 Auto-Reply AI Assistant v2.109 - tabreg key unify + orphan re
       if (fired) return;
       const snap = snapshot();
       const ok =
-        snap.readyState === "complete" &&
-        snap.textareaCount > 0 &&
-        snap.formCount > 0 &&
-        snap.personalRootOk;
+        snap.readyState !== "loading" &&
+        snap.hasChatRoot &&
+        (snap.textareaCount > 0 || snap.editableCount > 0);
       if (!ok) return;
       fired = true;
       cleanup(observer, intervalId);
       console.log(`[${label}] domGate ready`, {
         readyState: snap.readyState,
         textareaCount: snap.textareaCount,
+        editableCount: snap.editableCount,
         formCount: snap.formCount,
         iframeCount: snap.iframeCount,
+        hasChatRoot: snap.hasChatRoot,
       });
       Promise.resolve()
         .then(() => initFn && initFn())
@@ -3153,8 +3155,10 @@ console.log("OLV29 Auto-Reply AI Assistant v2.109 - tabreg key unify + orphan re
         console.warn(`[${label}] domGate timeout`, {
           readyState: snap.readyState,
           textareaCount: snap.textareaCount,
+          editableCount: snap.editableCount,
           formCount: snap.formCount,
           iframeCount: snap.iframeCount,
+          hasChatRoot: snap.hasChatRoot,
         });
         if (intervalId) clearInterval(intervalId);
         // observer remains to catch late DOM appearance
@@ -3167,15 +3171,17 @@ console.log("OLV29 Auto-Reply AI Assistant v2.109 - tabreg key unify + orphan re
       console.log(`[${label}] domGate start`, {
         readyState: snap.readyState,
         textareaCount: snap.textareaCount,
+        editableCount: snap.editableCount,
         formCount: snap.formCount,
         iframeCount: snap.iframeCount,
+        hasChatRoot: snap.hasChatRoot,
       });
     }
 
     tryReady(observer, intervalId);
   }
 
-/** ===== Main ===== */
+  /** ===== Main ===== */
   async function init() {
     console.log("[OLV29] init() called - starting initialization...");
 
