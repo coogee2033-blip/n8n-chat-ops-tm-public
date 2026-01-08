@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OLV29 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.110
+// @version      2.111
 // @description  OLV専用AIパネル（mem44互換、DOMだけOLV対応）
 // @author       coogee2033
 // @match        https://olv29.com/*
@@ -22,7 +22,7 @@
 
 // NOTE: このスクリプトは GitHub raw からインストール・更新される想定です。
 // Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください
-// v2.110: domGate allow interactive + input detection hardening
+// v2.110: domGate allow interactive + input detection hardening (ui/input split)
 
 /*
   === OLV29 専用 Tampermonkey スクリプト ===
@@ -45,7 +45,7 @@
     - div.inbox
 */
 
-console.log("OLV29 Auto-Reply AI Assistant v2.110 - tabreg key unify + orphan recovery + dom gate");
+console.log("OLV29 Auto-Reply AI Assistant v2.111 - tabreg key unify + orphan recovery + dom gate");
 
 (() => {
   "use strict";
@@ -3097,8 +3097,62 @@ console.log("OLV29 Auto-Reply AI Assistant v2.110 - tabreg key unify + orphan re
     }, 500);
   }
 
-    /** ===== DOM Ready Gate ===== */
-  function waitForDomReadyGate(initFn, label = "OLV29") {
+    /** ===== DOM Ready Gates ===== */
+  function waitForUiGate(initFn, label = "OLV29") {
+    let started = false;
+    let fired = false;
+    const pollMs = 300;
+    const timeoutMs = 20000;
+
+    const cleanup = (observer, intervalId) => {
+      if (intervalId) clearInterval(intervalId);
+      if (observer) observer.disconnect();
+    };
+
+    const snapshot = () => {
+      const rootOk = !!getChatRoot();
+      return {
+        readyState: document.readyState,
+        iframeCount: document.querySelectorAll("iframe").length,
+        hasChatRoot: rootOk,
+      };
+    };
+
+    const tryReady = (observer, intervalId) => {
+      if (fired) return;
+      const snap = snapshot();
+      const ok = snap.readyState !== "loading" && snap.hasChatRoot;
+      if (!ok) return;
+      fired = true;
+      cleanup(observer, intervalId);
+      console.log(`[${label}] uiGate ready`, snap);
+      Promise.resolve()
+        .then(() => initFn && initFn())
+        .catch((e) => console.warn(`[${label}] uiGate init error`, e));
+    };
+
+    const observer = new MutationObserver(() => tryReady(observer, intervalId));
+    const root = document.body || document.documentElement;
+    if (root) observer.observe(root, { childList: true, subtree: true });
+    const intervalId = setInterval(() => tryReady(observer, intervalId), pollMs);
+    setTimeout(() => {
+      if (!fired) {
+        const snap = snapshot();
+        console.warn(`[${label}] uiGate timeout`, snap);
+        if (intervalId) clearInterval(intervalId);
+      }
+    }, timeoutMs);
+
+    if (!started) {
+      started = true;
+      const snap = snapshot();
+      console.log(`[${label}] uiGate start`, snap);
+    }
+
+    tryReady(observer, intervalId);
+  }
+
+  function waitForInputGate(startFn, label = "OLV29") {
     let started = false;
     let fired = false;
     const pollMs = 300;
@@ -3111,12 +3165,31 @@ console.log("OLV29 Auto-Reply AI Assistant v2.110 - tabreg key unify + orphan re
 
     const snapshot = () => {
       const root = getChatRoot() || document;
+      let textareaCount = root.querySelectorAll("textarea").length;
+      let editableCount = root.querySelectorAll('[contenteditable="true"]')?.length || 0;
+      const iframes = Array.from(document.querySelectorAll("iframe"));
+      let iframeCount = iframes.length;
+      for (const frame of iframes) {
+        const src = frame.getAttribute('src') || frame.src || '';
+        try {
+          const doc = frame.contentDocument;
+          if (doc) {
+            textareaCount += doc.querySelectorAll('textarea').length;
+            editableCount += doc.querySelectorAll('[contenteditable="true"]')?.length || 0;
+            console.debug(`[${label}] inputGate iframe scan`, { src, sameOrigin: true, accessible: true });
+          } else {
+            console.debug(`[${label}] inputGate iframe scan`, { src, sameOrigin: true, accessible: false });
+          }
+        } catch (e) {
+          console.debug(`[${label}] inputGate iframe scan`, { src, sameOrigin: false, accessible: false });
+        }
+      }
       return {
         readyState: document.readyState,
-        textareaCount: root.querySelectorAll("textarea").length,
-        editableCount: root.querySelectorAll('[contenteditable="true"]').length,
-        formCount: root.querySelectorAll("form").length,
-        iframeCount: document.querySelectorAll("iframe").length,
+        textareaCount,
+        editableCount,
+        formCount: root.querySelectorAll('form').length,
+        iframeCount,
         hasChatRoot: !!getChatRoot(),
       };
     };
@@ -3131,58 +3204,35 @@ console.log("OLV29 Auto-Reply AI Assistant v2.110 - tabreg key unify + orphan re
       if (!ok) return;
       fired = true;
       cleanup(observer, intervalId);
-      console.log(`[${label}] domGate ready`, {
-        readyState: snap.readyState,
-        textareaCount: snap.textareaCount,
-        editableCount: snap.editableCount,
-        formCount: snap.formCount,
-        iframeCount: snap.iframeCount,
-        hasChatRoot: snap.hasChatRoot,
-      });
+      console.log(`[${label}] inputGate ready`, snap);
       Promise.resolve()
-        .then(() => initFn && initFn())
-        .catch((e) => console.warn(`[${label}] domGate init error`, e));
+        .then(() => startFn && startFn())
+        .catch((e) => console.warn(`[${label}] inputGate start error`, e));
     };
 
-    const root = document.body || document.documentElement;
     const observer = new MutationObserver(() => tryReady(observer, intervalId));
+    const root = document.body || document.documentElement;
     if (root) observer.observe(root, { childList: true, subtree: true });
     const intervalId = setInterval(() => tryReady(observer, intervalId), pollMs);
-
     setTimeout(() => {
       if (!fired) {
         const snap = snapshot();
-        console.warn(`[${label}] domGate timeout`, {
-          readyState: snap.readyState,
-          textareaCount: snap.textareaCount,
-          editableCount: snap.editableCount,
-          formCount: snap.formCount,
-          iframeCount: snap.iframeCount,
-          hasChatRoot: snap.hasChatRoot,
-        });
+        console.warn(`[${label}] inputGate timeout`, snap);
         if (intervalId) clearInterval(intervalId);
-        // observer remains to catch late DOM appearance
       }
     }, timeoutMs);
 
     if (!started) {
       started = true;
       const snap = snapshot();
-      console.log(`[${label}] domGate start`, {
-        readyState: snap.readyState,
-        textareaCount: snap.textareaCount,
-        editableCount: snap.editableCount,
-        formCount: snap.formCount,
-        iframeCount: snap.iframeCount,
-        hasChatRoot: snap.hasChatRoot,
-      });
+      console.log(`[${label}] inputGate start`, snap);
     }
 
     tryReady(observer, intervalId);
   }
 
   /** ===== Main ===== */
-  async function init() {
+  async function initUI() {
     console.log("[OLV29] init() called - starting initialization...");
 
     if (!isPersonalSendPage()) {
@@ -3215,10 +3265,23 @@ console.log("OLV29 Auto-Reply AI Assistant v2.110 - tabreg key unify + orphan re
     watchPairMemoChanges();
     hookSendButtonAutoSave();
 
-    mountAuto();
     log("ready.");
   }
 
-  waitForDomReadyGate(() => init(), "OLV29");
+  function startAutomation() {
+    if (window.__chatopsAutomationStarted) {
+      log("skip: automation already started");
+      return;
+    }
+    window.__chatopsAutomationStarted = true;
+    if (!isPersonalSendPage()) {
+      log("skip: not personalbox (automation)");
+      return;
+    }
+    mountAuto();
+  }
+
+  waitForUiGate(() => initUI(), "OLV29");
+  waitForInputGate(() => startAutomation(), "OLV29");
 })();
 
