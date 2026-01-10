@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.112
+// @version      2.113
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -22,7 +22,7 @@
 
 // NOTE: このスクリプトは GitHub raw からインストール・更新される想定です。
 // Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください
-// v2.112: iframe-aware inputGate + sandbox debug export
+// v2.113: inputGate readiness via reply-target + debug export refresh
 
 /*
   === mem44 専用 Tampermonkey スクリプト ===
@@ -32,7 +32,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.112 - iframe-aware inputGate");
+console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target");
 
 (() => {
   "use strict";
@@ -99,6 +99,14 @@ console.log("MEM44 Auto-Reply AI Assistant v2.112 - iframe-aware inputGate");
     );
 
   const log = (...a) => console.debug("[DatingOps]", ...a);
+  const CONTENTEDITABLE_SELECTOR =
+    '[contenteditable], [contenteditable="true" i], [contenteditable="plaintext-only" i]';
+
+  const inputGateState = {
+    ready: false,
+    lastSnapshot: null,
+    lastTarget: null,
+  };
 
   // ========== Global Queue System (Cross-Tab Coordination) ==========
   const QUEUE_KEY = "chatops.queue.v1";
@@ -123,7 +131,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.112 - iframe-aware inputGate");
   const MAX_ACTIVE_JOBS = 20;          // v2.100: running + pending の制限
 
   // Align with OLV: expose SCRIPT_VERSION for diagnostics
-  const SCRIPT_VERSION = "2.107";
+  const SCRIPT_VERSION = "2.113";
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
@@ -376,6 +384,65 @@ console.log("MEM44 Auto-Reply AI Assistant v2.112 - iframe-aware inputGate");
       if (v) return v;
     }
     return "";
+  }
+
+  function scanFramesWithInfo(label = "MEM44") {
+    const frames = [];
+    const docs = [];
+    qsa("iframe").forEach((ifr) => {
+      const info = {
+        src:
+          ifr.getAttribute("src") ||
+          ifr?.contentWindow?.location?.href ||
+          "(inline/unknown)",
+        sameOrigin: false,
+        accessible: false,
+        textareaCount: 0,
+        editableCount: 0,
+        formCount: 0,
+      };
+      try {
+        const doc =
+          ifr.contentDocument ||
+          (ifr.contentWindow && ifr.contentWindow.document) ||
+          null;
+        if (doc && doc.nodeType === 9) {
+          info.sameOrigin = true;
+          info.accessible = true;
+          info.textareaCount = doc.querySelectorAll("textarea").length;
+          info.editableCount =
+            doc.querySelectorAll(CONTENTEDITABLE_SELECTOR).length;
+          info.formCount = doc.querySelectorAll("form").length;
+          frames.push(info);
+          docs.push({
+            doc,
+            win: doc.defaultView || doc.parentWindow || ifr.contentWindow || null,
+            frameInfo: info,
+            iframeEl: ifr,
+          });
+        } else {
+          info.sameOrigin = true;
+          frames.push(info);
+        }
+      } catch {
+        info.sameOrigin = false;
+        info.accessible = false;
+        frames.push(info);
+      }
+    });
+    if (frames.length > 0) {
+      console.debug(`[${label}] inputGate iframe scan`, frames);
+    }
+    return { frames, docs };
+  }
+
+  function describeNode(node) {
+    if (!node) return null;
+    return {
+      tag: node.tagName || "",
+      id: node.id || "",
+      className: node.className || "",
+    };
   }
 
   // mid候補: mid, member_id, member_id1
@@ -2517,59 +2584,149 @@ console.log("MEM44 Auto-Reply AI Assistant v2.112 - iframe-aware inputGate");
   }
 
   /** ===== 返信欄 ===== */
-  function pickReplyTextarea() {
-    const sendBtn = qsa('input[type="submit"],button').find((b) =>
-      /送信して閉じる/.test(b.value || b.textContent || "")
-    );
-    const form = sendBtn ? sendBtn.closest("form") || null : null;
+  function pickReplyTarget(label = "MEM44") {
+    const frameScan = scanFramesWithInfo(label);
+    const docEntries = [
+      { doc: document, win: window, frameInfo: null, viaIframe: false },
+      ...frameScan.docs.map((d) => ({
+        doc: d.doc,
+        win: d.win || window,
+        frameInfo: d.frameInfo,
+        viaIframe: true,
+      })),
+    ];
 
-    if (form) {
-      const direct = form.querySelector(
-        'textarea[name*="message" i], textarea[id*="message" i]'
+    const candidates = [];
+
+    const pushCandidate = (el, ctx, formBound, distance) => {
+      if (!el || !ctx?.doc) return;
+      const targetType =
+        (el.tagName || "").toUpperCase() === "TEXTAREA" ? "textarea" : "contenteditable";
+      const dist = Number.isFinite(distance) ? distance : 999999;
+      candidates.push({
+        el,
+        doc: ctx.doc,
+        win: ctx.win || ctx.doc.defaultView || window,
+        viaIframe: !!ctx.viaIframe,
+        frameInfo: ctx.frameInfo || null,
+        formBound: !!formBound,
+        targetType,
+        distance: dist,
+      });
+    };
+
+    const calcDistance = (a, b) => {
+      if (!a || !b || !a.getBoundingClientRect || !b.getBoundingClientRect) return null;
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return Math.hypot(
+        (ra.left + ra.right) / 2 - (rb.left + rb.right) / 2,
+        ra.bottom - rb.top
       );
-      if (direct) return direct;
-      const t2 = [...form.querySelectorAll("textarea")][0];
-      if (t2) return t2;
+    };
+
+    for (const ctx of docEntries) {
+      const { doc } = ctx;
+      if (!doc) continue;
+      const sendBtn = qsa('input[type="submit"],button', doc).find((b) =>
+        /送信して閉じる/.test(b.value || b.textContent || "")
+      );
+      const form = sendBtn ? sendBtn.closest("form") || null : null;
+
+      if (form) {
+        const formTargets = [
+          ...qsa('textarea[name*="message" i], textarea[id*="message" i]', form),
+          ...qsa(CONTENTEDITABLE_SELECTOR, form),
+          ...qsa("textarea", form),
+        ];
+        if (formTargets.length) {
+          const el = formTargets[0];
+          pushCandidate(el, ctx, true, calcDistance(el, sendBtn));
+        }
+      }
+
+      const controls = [
+        ...qsa("textarea", doc),
+        ...qsa(CONTENTEDITABLE_SELECTOR, doc),
+      ];
+      if (controls.length) {
+        let el = controls[0];
+        if (sendBtn && controls.length > 1) {
+          el =
+            controls.reduce((best, cur) => {
+              const d = calcDistance(cur, sendBtn);
+              if (!best || (d != null && d < best.d)) return { el: cur, d };
+              return best;
+            }, null)?.el || el;
+        }
+        pushCandidate(el, ctx, false, calcDistance(el, sendBtn));
+      }
     }
-    const all = [...document.querySelectorAll("textarea")];
-    if (!all.length) return null;
-    if (!sendBtn) return all[0];
-    const sb = sendBtn.getBoundingClientRect();
-    return (
-      all.reduce((best, ta) => {
-        const r = ta.getBoundingClientRect();
-        const d = Math.hypot(
-          (r.left + r.right) / 2 - (sb.left + sb.right) / 2,
-          r.bottom - sb.top
-        );
-        return !best || d < best.d ? { el: ta, d } : best;
-      }, null)?.el || null
-    );
+
+    if (!candidates.length) {
+      inputGateState.lastTarget = null;
+      return null;
+    }
+
+    candidates.sort((a, b) => {
+      if (a.formBound !== b.formBound) return a.formBound ? -1 : 1;
+      if (a.targetType !== b.targetType)
+        return a.targetType === "textarea" ? -1 : 1;
+      if (a.viaIframe !== b.viaIframe) return a.viaIframe ? 1 : -1;
+      return a.distance - b.distance;
+    });
+
+    inputGateState.lastTarget = candidates[0];
+    return candidates[0];
   }
 
   function insertReply(text) {
     if (!text) return false;
-    const ta = pickReplyTextarea();
-    if (!ta) return false;
+    const target = pickReplyTarget();
+    if (!target || !target.el) return false;
+
+    const ta = target.el;
+    const ownerDoc = target.doc || ta.ownerDocument || document;
+    const ownerWin = target.win || ownerDoc.defaultView || window;
 
     // C3: 改行保持のデバッグ（挿入前後で \n\n を確認）
-    const hasDoubleNewlineBefore = text.includes('\n\n');
-    console.debug('[MEM44] insertReply: hasDoubleNewline(before)=', hasDoubleNewlineBefore, ', len=', text.length);
+    const hasDoubleNewlineBefore = text.includes("\n\n");
+    console.debug("[MEM44] insertReply: hasDoubleNewline(before)=", hasDoubleNewlineBefore, ", len=", text.length, {
+      viaIframe: target.viaIframe,
+      targetType: target.targetType,
+    });
 
-    ta.focus();
-    // textarea.value に直接代入（innerText/textContent/innerHTML は使わない）
-    ta.value = text;
-    ["input", "change", "keyup"].forEach((ev) =>
-      ta.dispatchEvent(new Event(ev, { bubbles: true }))
-    );
+    if (typeof ta.focus === "function") {
+      try {
+        ta.focus();
+      } catch {}
+    }
 
-    // C3: 挿入後の確認
-    const hasDoubleNewlineAfter = ta.value.includes('\n\n');
-    console.debug('[MEM44] insertReply: hasDoubleNewline(after)=', hasDoubleNewlineAfter, ', textarea.value.len=', ta.value.length);
+    if (target.targetType === "textarea") {
+      ta.value = text;
+    } else {
+      ta.innerText = text;
+    }
 
-    try {
-      ta.selectionStart = ta.selectionEnd = ta.value.length;
-    } catch {}
+    const dispatch = (name) => {
+      try {
+        const evt = new ownerWin.Event(name, { bubbles: true });
+        ta.dispatchEvent(evt);
+      } catch {
+        try {
+          ta.dispatchEvent(new Event(name, { bubbles: true }));
+        } catch {}
+      }
+    };
+    ["input", "change", "keyup"].forEach(dispatch);
+
+    if (target.targetType === "textarea") {
+      const hasDoubleNewlineAfter = ta.value.includes("\n\n");
+      console.debug("[MEM44] insertReply: hasDoubleNewline(after)=", hasDoubleNewlineAfter, ", textarea.value.len=", ta.value.length);
+      try {
+        ta.selectionStart = ta.selectionEnd = ta.value.length;
+      } catch {}
+    }
     return true;
   }
 
@@ -3118,82 +3275,99 @@ console.log("MEM44 Auto-Reply AI Assistant v2.112 - iframe-aware inputGate");
   }
 
   function waitForInputGate(startFn, label = "MEM44") {
-    let started = false;
     let fired = false;
-    const pollMs = 300;
-    const timeoutMs = 20000;
+    inputGateState.ready = false;
+    const pollMs = 400;
+    const timeoutMs = 15000;
+    const observers = [];
+    const observedDocs = new WeakSet();
+    const frameLoadListeners = [];
 
-    const cleanup = (observer, intervalId) => {
-      if (intervalId) clearInterval(intervalId);
-      if (observer) observer.disconnect();
+    const cleanup = () => {
+      observers.forEach((o) => o.disconnect());
+      frameLoadListeners.forEach(({ iframe, handler }) => {
+        try {
+          iframe.removeEventListener("load", handler, true);
+        } catch {}
+      });
+    };
+
+    const attachObserver = (doc) => {
+      if (!doc || observedDocs.has(doc)) return;
+      const root = doc.body || doc.documentElement;
+      if (!root) return;
+      const obs = new MutationObserver(() => tryReady("mutation"));
+      obs.observe(root, { childList: true, subtree: true, attributes: true });
+      observers.push(obs);
+      observedDocs.add(doc);
+    };
+
+    const attachFrameLoad = (iframe) => {
+      if (!iframe || iframe.dataset?.inputGateLoadAttached === "1") return;
+      const handler = () => tryReady("iframe-load");
+      iframe.addEventListener("load", handler, true);
+      iframe.dataset.inputGateLoadAttached = "1";
+      frameLoadListeners.push({ iframe, handler });
     };
 
     const snapshot = () => {
-      const root = getChatRoot() || document;
-      let textareaCount = root.querySelectorAll("textarea").length;
-      let editableCount = root.querySelectorAll('[contenteditable="true"]')?.length || 0;
-      const iframes = Array.from(document.querySelectorAll("iframe"));
-      let iframeCount = iframes.length;
-      for (const frame of iframes) {
-        const src = frame.getAttribute('src') || frame.src || '';
-        try {
-          const doc = frame.contentDocument;
-          if (doc) {
-            textareaCount += doc.querySelectorAll('textarea').length;
-            editableCount += doc.querySelectorAll('[contenteditable="true"]')?.length || 0;
-            console.debug(`[${label}] inputGate iframe scan`, { src, sameOrigin: true, accessible: true });
-          } else {
-            console.debug(`[${label}] inputGate iframe scan`, { src, sameOrigin: true, accessible: false });
-          }
-        } catch (e) {
-          console.debug(`[${label}] inputGate iframe scan`, { src, sameOrigin: false, accessible: false });
-        }
-      }
-      return {
+      const frameScan = scanFramesWithInfo(label);
+      frameScan.docs.forEach((d) => attachObserver(d.doc));
+      frameScan.docs.forEach((d) => attachFrameLoad(d.iframeEl));
+
+      const textareaCountDoc = document.querySelectorAll("textarea").length;
+      const editableCountDoc =
+        document.querySelectorAll(CONTENTEDITABLE_SELECTOR).length;
+      const formCountDoc = document.querySelectorAll("form").length;
+      const chatRoot = getChatRoot();
+      const target = pickReplyTarget(label);
+
+      const snap = {
         readyState: document.readyState,
-        textareaCount,
-        editableCount,
-        formCount: root.querySelectorAll('form').length,
-        iframeCount,
-        hasChatRoot: !!getChatRoot(),
+        textareaCountDoc,
+        editableCountDoc,
+        formCountDoc,
+        iframeCount: frameScan.frames.length,
+        frames: frameScan.frames,
+        hasChatRoot: !!chatRoot,
+        chatRootHint: describeNode(chatRoot),
+        targetFound: !!target,
+        targetType: target?.targetType || null,
+        viaIframe: !!target?.viaIframe,
       };
+      inputGateState.lastSnapshot = snap;
+      return snap;
     };
 
-    const tryReady = (observer, intervalId) => {
+    const tryReady = (reason = "poll") => {
       if (fired) return;
       const snap = snapshot();
       const ok =
-        snap.readyState !== "loading" &&
-        snap.hasChatRoot &&
-        (snap.textareaCount > 0 || snap.editableCount > 0);
+        document.readyState !== "loading" &&
+        snap.targetFound;
       if (!ok) return;
       fired = true;
-      cleanup(observer, intervalId);
-      console.log(`[${label}] inputGate ready`, snap);
+      inputGateState.ready = true;
+      cleanup();
+      console.log(`[${label}] inputGate ready`, { ...snap, reason });
       Promise.resolve()
         .then(() => startFn && startFn())
         .catch((e) => console.warn(`[${label}] inputGate start error`, e));
     };
 
-    const observer = new MutationObserver(() => tryReady(observer, intervalId));
-    const root = document.body || document.documentElement;
-    if (root) observer.observe(root, { childList: true, subtree: true });
-    const intervalId = setInterval(() => tryReady(observer, intervalId), pollMs);
+    attachObserver(document);
+    const intervalId = setInterval(() => tryReady("interval"), pollMs);
     setTimeout(() => {
       if (!fired) {
         const snap = snapshot();
         console.warn(`[${label}] inputGate timeout`, snap);
-        if (intervalId) clearInterval(intervalId);
+        clearInterval(intervalId);
+        cleanup();
       }
     }, timeoutMs);
 
-    if (!started) {
-      started = true;
-      const snap = snapshot();
-      console.log(`[${label}] inputGate start`, snap);
-    }
-
-    tryReady(observer, intervalId);
+    console.log(`[${label}] inputGate start`, snapshot());
+    tryReady("start");
   }
 
   /** ===== Main ===== */
@@ -3243,6 +3417,37 @@ console.log("MEM44 Auto-Reply AI Assistant v2.112 - iframe-aware inputGate");
     mountAuto();
   }
 
+  function exportDebug(label = "MEM44") {
+    const tgt = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+    const dbg = tgt.__datingopsDebug || {};
+    const api = {
+      snapshotInputGate: () => inputGateState.lastSnapshot || null,
+      snapshotChatRoot: () => {
+        const root = getChatRoot();
+        return root
+          ? { found: true, ...describeNode(root) }
+          : { found: false };
+      },
+      snapshotFrames: () => {
+        if (inputGateState.lastSnapshot?.frames) return inputGateState.lastSnapshot.frames;
+        return scanFramesWithInfo(label).frames;
+      },
+      pickReplyTargetDebug: () => {
+        const t = pickReplyTarget(label);
+        return {
+          found: !!t,
+          targetType: t?.targetType || null,
+          viaIframe: !!t?.viaIframe,
+          frameInfo: t?.frameInfo || null,
+        };
+      },
+    };
+    Object.assign(dbg, api);
+    tgt.__datingopsDebug = dbg;
+    window.__datingopsDebug = tgt.__datingopsDebug;
+  }
+
+  exportDebug("MEM44");
   waitForUiGate(() => initUI(), "MEM44");
   waitForInputGate(() => startAutomation(), "MEM44");
 })();
