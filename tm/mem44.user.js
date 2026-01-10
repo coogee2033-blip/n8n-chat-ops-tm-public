@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.111
+// @version      2.112
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -22,7 +22,7 @@
 
 // NOTE: このスクリプトは GitHub raw からインストール・更新される想定です。
 // Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください
-// v2.110: domGate allow interactive + input detection hardening (ui/input split)
+// v2.112: iframe-aware inputGate + sandbox debug export
 
 /*
   === mem44 専用 Tampermonkey スクリプト ===
@@ -32,7 +32,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.111 - tabreg key unify + orphan recovery + dom gate");
+console.log("MEM44 Auto-Reply AI Assistant v2.112 - iframe-aware inputGate");
 
 (() => {
   "use strict";
