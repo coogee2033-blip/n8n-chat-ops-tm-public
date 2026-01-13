@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MEM44 Auto-Reply AI Assistant
 // @namespace    tamper-datingops
-// @version      2.113
+// @version      2.114
 // @description  mem44 個別送信用のAIパネル（元のDatingOps Panelと同等機能）
 // @author       coogee2033
 // @match        https://mem44.com/*
@@ -21,8 +21,7 @@
 // ==/UserScript==
 
 // NOTE: このスクリプトは GitHub raw からインストール・更新される想定です。
-// Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください
-// v2.113: inputGate readiness via reply-target + debug export refresh
+// Tampermonkey 上で直接編集せず、このリポジトリのファイルを変更してからバージョンを上げてください。
 
 /*
   === mem44 専用 Tampermonkey スクリプト ===
@@ -32,7 +31,7 @@
   OLV29 用バージョンは同じフォルダの `tm/olv29.user.js` が担当します。
 */
 
-console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target");
+// v2.114 - n8n cross-tab lock (empty body fix)
 
 (() => {
   "use strict";
@@ -63,13 +62,13 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
   );
   const PANEL_ID = "datingops-ai-panel";
   const AUTO_SEND_ON_LOAD = false;  // open-check押下でのみ自動送信
-  const AUTO_SEND_ON_NEW_MALE = true;
+  const AUTO_SEND_ON_NEW_MALE = false;
   const SHOW_QUEUE_STATUS = false; // C4: キュー表示を抑止（true にすると表示）
   const LOAD_DELAY_MS = 600;
   const RETRY_READ_CHAT = 3;
   const RETRY_READ_GAP = 250;
   const DUP_WINDOW_MS = 10_000;
-  const REQUEST_TIMEOUT = 120_000; // webhook送信の最大待ち時間（2分）
+  const REQUEST_TIMEOUT = 45_000; // webhook送信の最大待ち時間
   const diagState = {
     lastRequestAt: "-",
     lastResult: "-",
@@ -86,6 +85,63 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
   let inFlight = false;
   let inFlightAt = 0;
 
+  /** ===== タブ間ロック機構（n8n 空ボディ対策） ===== */
+  const N8N_LOCK_KEY = "mem44_n8n_send_lock";
+  const N8N_LOCK_TTL_MS = 90000;    // ロックTTL: 90秒（クラッシュ時の自然回復用）
+  const N8N_LOCK_WAIT_MS = 60000;   // 最大待ち時間: 60秒
+  const N8N_LOCK_POLL_MS = 500;     // ポーリング間隔: 500ms
+  const n8nLockId = (() => {
+    try { return crypto.randomUUID(); }
+    catch { return `tab_${Date.now()}_${Math.random().toString(36).slice(2)}`; }
+  })();
+
+  function getN8nLock() {
+    try {
+      const raw = localStorage.getItem(N8N_LOCK_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch { return null; }
+  }
+
+  function setN8nLock(owner, until) {
+    try {
+      localStorage.setItem(N8N_LOCK_KEY, JSON.stringify({ owner, until }));
+      return true;
+    } catch { return false; }
+  }
+
+  function clearN8nLock() {
+    try { localStorage.removeItem(N8N_LOCK_KEY); } catch {}
+  }
+
+  async function acquireN8nLock() {
+    const startWait = Date.now();
+    while (Date.now() - startWait < N8N_LOCK_WAIT_MS) {
+      const lock = getN8nLock();
+      const now = Date.now();
+      // ロックなし or 期限切れ or 自分のロック → 取得/更新OK
+      if (!lock || lock.until < now || lock.owner === n8nLockId) {
+        if (setN8nLock(n8nLockId, now + N8N_LOCK_TTL_MS)) {
+          console.log("[MEM44] n8n lock acquired:", n8nLockId);
+          return true;
+        }
+      }
+      // 他タブがロック中 → 待機
+      setStatus("他タブ送信中…", "#a78bfa");
+      await new Promise(r => setTimeout(r, N8N_LOCK_POLL_MS));
+    }
+    console.warn("[MEM44] n8n lock timeout after", N8N_LOCK_WAIT_MS, "ms");
+    return false;
+  }
+
+  function releaseN8nLock() {
+    const lock = getN8nLock();
+    if (lock && lock.owner === n8nLockId) {
+      clearN8nLock();
+      console.log("[MEM44] n8n lock released:", n8nLockId);
+    }
+  }
+
   /** ===== util ===== */
   const qs = (s, r = document) => r.querySelector(s);
   const qsa = (s, r = document) => [...r.querySelectorAll(s)];
@@ -99,176 +155,22 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     );
 
   const log = (...a) => console.debug("[DatingOps]", ...a);
-  const CONTENTEDITABLE_SELECTOR =
-    '[contenteditable], [contenteditable="true" i], [contenteditable="plaintext-only" i]';
-
-  const inputGateState = {
-    ready: false,
-    lastSnapshot: null,
-    lastTarget: null,
-  };
 
   // ========== Global Queue System (Cross-Tab Coordination) ==========
   const QUEUE_KEY = "chatops.queue.v1";
   const LOCK_KEY = "chatops.queue.lock.v1";
   const PROGRESS_KEY = "chatops.queue.progress.v1";
-  const DEFERRED_KEY = "chatops.deferred.v1";  // v2.100: 遅延登録用
-  const TABREG_KEY = "chatops.tabreg.v1";      // v2.102: オープンタブ・レジストリ（olv/mem 共通キー）
-  const TABREG_KEY_OLD = "chatops.tabs.v1";    // 旧キー互換（v2.102系）
   const LOCK_TTL_MS = 60_000;        // ロック TTL 60秒
   const HEARTBEAT_INTERVAL_MS = 15_000; // ハートビート 15秒
   const DISPATCH_INTERVAL_MS = 1_000;   // ディスパッチ間隔 1秒
-  const WATCHDOG_INTERVAL_MS = 10_000;  // v2.100: watchdog 10秒間隔
-  const WATCHDOG_STALE_MS = 60_000;     // v2.100: 60秒動きがなければ stale 判定
-  const TABREG_TTL_MS = 300_000;        // v2.103: 5分更新なしで死亡扱い（バックグラウンド対策）
-  const TABREG_HEARTBEAT_MS = 30_000;   // v2.103: 30秒ごとにタブ登録更新
-  const ORPHAN_PENDING_TTL_MS = 120_000; // v2.104: 開いているタブが無い pending を自動掃除する猶予（2分）
-  const ORPHAN_RUNNING_TTL_MS = 120_000; // v2.107: 開いているタブが無い running を自動回復する猶予（2分）
   const MAX_RETRIES = 2;               // 最大リトライ回数
   const RETRY_DELAYS = [1000, 3000];   // 指数バックオフ
   const AUTO_FIRED_PREFIX = "autoFired.v2.86";
-  const QUEUE_LIMIT = 25;              // v2.100: キュー上限を 25 に拡張
-  const MAX_ACTIVE_JOBS = 20;          // v2.100: running + pending の制限
-
-  // Align with OLV: expose SCRIPT_VERSION for diagnostics
-  const SCRIPT_VERSION = "2.113";
+  const QUEUE_LIMIT = 5;
   const MAX_JOB_ATTEMPTS = 5;
   const BACKOFF_BASE_MS = 1000;
   const BACKOFF_MAX_MS = 60000;
   const OPEN_CHECK_TTL_MS = 10_000;
-
-  // ===== Debug / Reset (console callable) =====
-  g.__chatopsDebugMem44 = () => {
-    const getJSON = (k) => { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch { return null; } };
-    const q = getJSON(QUEUE_KEY) || {};
-    const p = getJSON(PROGRESS_KEY) || {};
-    const lock = getJSON(LOCK_KEY) || {};
-    const deferred = getJSON(DEFERRED_KEY) || [];
-    const rawTabReg = getJSON(TABREG_KEY) || { version: 1, tabs: {} };
-    const tabReg = pruneTabRegistry(rawTabReg);
-    const lockAgeMs = lock?.acquiredAt ? Date.now() - lock.acquiredAt : null;
-    const panelCount = document.querySelectorAll("#" + PANEL_ID).length;
-    const myJobId = getMyJobId();
-    const pendingJobs = (q.items || []).filter(it => it.status === "pending");
-
-    const summary = {
-      version: "2.107",
-      SCRIPT_VERSION,
-      AUTO_SEND_ON_NEW_MALE,
-      QUEUE_LIMIT,
-      MAX_ACTIVE_JOBS,
-      REQUEST_TIMEOUT,
-      panelCount,
-      // v2.102: タブ情報
-      tabId: TAB_ID,
-      myJobId,
-      isMyJobOpen: isJobOpenSomewhere(myJobId),
-      tabRegistry: tabReg,
-      openTabCount: Object.keys(tabReg.tabs).length,
-      // キュー情報
-      queueLen: (q.items || []).length,
-      queueItems: (q.items || []).map(it => ({ jobId: it.jobId, status: it.status })),
-      pendingCount: pendingJobs.length,
-      deferredLen: deferred.length,
-      deferredJobs: deferred,
-      progressCurrentJobId: p.currentJobId || null,
-      progressRunning: p.running || 0,
-      progressLastActivity: p.lastActivity || null,
-      lockOwnerId: lock.ownerId || null,
-      lockAgeMs,
-      watchdogActive: !!__watchdogTimer,
-      tabRegHeartbeatActive: !!__tabRegHeartbeatTimer,
-      initGuard: {
-        __datingOpsInitDone: typeof g.__datingOpsInitDone !== "undefined" ? g.__datingOpsInitDone : null,
-        __datingOpsInitialized: typeof g.__datingOpsInitialized !== "undefined" ? g.__datingOpsInitialized : null,
-      },
-    };
-    console.log("[MEM44][diag]", summary);
-    return summary;
-  };
-
-  g.__chatopsResetStateMem44 = () => {
-    let removed = 0;
-    const prefixes = ["autoFired::", "autoFired.", "chatops.queue.", "chatops.deferred.", "chatops.tabs.", "chatops.tabreg.", "_auto_last_sig", "mem44_auto_last_sig"];
-    for (let i = localStorage.length - 1; i >= 0; i--) {
-      const key = localStorage.key(i);
-      if (!key) continue;
-      if (prefixes.some(p => key.includes(p))) {
-        localStorage.removeItem(key);
-        removed++;
-      }
-    }
-    [QUEUE_KEY, LOCK_KEY, PROGRESS_KEY, DEFERRED_KEY, TABREG_KEY].forEach(k => {
-      if (localStorage.getItem(k) !== null) {
-        localStorage.removeItem(k);
-        removed++;
-      }
-    });
-    // reset in-memory flags
-    workerActive = false;
-    inFlight = false;
-    autoDebounceTimer = null;
-    mutationObserverActive = false;
-    stopWatchdog();
-    console.log("[MEM44][reset] removed keys:", removed);
-    return removed;
-  };
-
-  // v2.100: deferredJobs をドレイン（強制 enqueue）
-  g.__chatopsDrainDeferredJobsMem44 = () => {
-    const deferred = getDeferredJobs();
-    if (deferred.length === 0) {
-      console.log("[MEM44][drainDeferred] no deferred jobs");
-      return 0;
-    }
-    console.log("[MEM44][drainDeferred] draining", deferred.length, "jobs");
-    let count = 0;
-    for (const job of deferred) {
-      const ok = enqueueJob(job.jobId, job.url, true); // force=true
-      if (ok) count++;
-    }
-    clearDeferredJobs();
-    console.log("[MEM44][drainDeferred] enqueued", count, "jobs");
-    return count;
-  };
-
-  // v2.100: watchdog タイマー
-  let __watchdogTimer = null;
-  let __lastProgressActivity = Date.now();
-
-  // ===== Boot helpers (dispatcher / listeners / triggers) =====
-  let __chatopsBooted = false;
-  function bootQueueOnce() {
-    if (__chatopsBooted) return;
-    __chatopsBooted = true;
-    try { pruneQueueIfTooLarge(); } catch (e) { console.warn("[MEM44] bootQueue pruneQueueIfTooLarge failed", e); }
-    try { setupStorageListener(); } catch (e) { console.warn("[MEM44] bootQueue setupStorageListener failed", e); }
-    try { migrateTabRegistryKey(); } catch (e) { console.warn("[MEM44] bootQueue migrateTabRegistryKey failed", e); }
-    try { startTabRegistryHeartbeat(); } catch (e) { console.warn("[MEM44] bootQueue startTabRegistryHeartbeat failed", e); }
-    try { startDispatcher(true); } catch (e) { console.warn("[MEM44] bootQueue startDispatcher failed", e); }
-    try { initOpenCheckClickListener(); } catch (e) { console.warn("[MEM44] bootQueue initOpenCheckClickListener failed", e); }
-    try { checkWindowLoadAutoTrigger(); } catch (e) { console.warn("[MEM44] bootQueue checkWindowLoadAutoTrigger failed", e); }
-  }
-  // v2.105: TABREG キー互換（olv/mem のキー不一致で「open tab が無い」扱いになり全停止する事故を防ぐ）
-  function migrateTabRegistryKey() {
-    try {
-      const cur = localStorage.getItem(TABREG_KEY);
-      const old = localStorage.getItem(TABREG_KEY_OLD);
-      // 新が無くて旧がある場合は移行
-      if (!cur && old) {
-        localStorage.setItem(TABREG_KEY, old);
-      }
-      // 常に旧キーを掃除（両方存在しても新を正として使う）
-      if (old) {
-        localStorage.removeItem(TABREG_KEY_OLD);
-      }
-    } catch (e) {
-      console.warn("[TabReg] migrateTabRegistryKey error:", e);
-    }
-  }
-// ========== v2.102: オープンタブ・レジストリ ==========
-
-  g.__chatopsBootQueueMem44 = bootQueueOnce;
 
   // タブ固有ID（セッション単位）
   const TAB_ID = (() => {
@@ -280,101 +182,6 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     return id;
   })();
 
-  // ========== v2.102: オープンタブ・レジストリ ==========
-  // dispatcher が「開いているタブの jobId」だけを選べるようにする
-
-  function getTabRegistry() {
-    try {
-      const raw = localStorage.getItem(TABREG_KEY);
-      if (!raw) return { version: 1, tabs: {} };
-      const reg = JSON.parse(raw);
-      if (reg.version !== 1) return { version: 1, tabs: {} };
-      return reg;
-    } catch { return { version: 1, tabs: {} }; }
-  }
-
-  function setTabRegistry(reg) {
-    try {
-      localStorage.setItem(TABREG_KEY, JSON.stringify(reg));
-    } catch (e) {
-      console.warn("[TabReg] setTabRegistry error:", e);
-    }
-  }
-
-  function upsertMyTabRegistry() {
-    try {
-      const reg = getTabRegistry();
-      const myJobId = getMyJobId();
-      reg.tabs[TAB_ID] = {
-        jobId: myJobId,
-        href: location.href,
-        ts: Date.now(),
-      };
-      setTabRegistry(reg);
-      console.log("[TabReg] upsert:", TAB_ID, "jobId:", myJobId);
-    } catch (e) {
-      console.warn("[TabReg] upsertMyTabRegistry error:", e);
-    }
-  }
-
-  function removeMyTabRegistry() {
-    try {
-      const reg = getTabRegistry();
-      if (reg.tabs[TAB_ID]) {
-        delete reg.tabs[TAB_ID];
-        setTabRegistry(reg);
-        console.log("[TabReg] removed:", TAB_ID);
-      }
-    } catch (e) {
-      console.warn("[TabReg] removeMyTabRegistry error:", e);
-    }
-  }
-
-  function pruneTabRegistry(reg) {
-    const now = Date.now();
-    const pruned = { version: 1, tabs: {} };
-    for (const [tabId, entry] of Object.entries(reg.tabs || {})) {
-      if (entry.ts && (now - entry.ts) < TABREG_TTL_MS) {
-        pruned.tabs[tabId] = entry;
-      }
-    }
-    return pruned;
-  }
-
-  function isJobOpenSomewhere(jobId) {
-    const reg = pruneTabRegistry(getTabRegistry());
-    for (const entry of Object.values(reg.tabs)) {
-      if (entry.jobId === jobId) return true;
-    }
-    return false;
-  }
-
-  let __tabRegHeartbeatTimer = null;
-  function startTabRegistryHeartbeat() {
-    if (__tabRegHeartbeatTimer) return;
-
-    // 初回登録
-    upsertMyTabRegistry();
-
-    // 定期更新
-    __tabRegHeartbeatTimer = setInterval(() => {
-      upsertMyTabRegistry();
-    }, TABREG_HEARTBEAT_MS);
-
-    // visibilitychange で復帰時に即更新
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") {
-        upsertMyTabRegistry();
-      }
-    });
-
-    // beforeunload / unload で自分の entry を削除
-    window.addEventListener("beforeunload", removeMyTabRegistry);
-    window.addEventListener("unload", removeMyTabRegistry);
-
-    console.log("[TabReg] heartbeat started, interval:", TABREG_HEARTBEAT_MS);
-  }
-
   // このタブの jobId（URL から安定キー生成）
   // URLパラメータを複数候補から取得するヘルパー
   // member_id1 / char_member_id1 など、サイトによって異なるパラメータ名に対応
@@ -384,65 +191,6 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
       if (v) return v;
     }
     return "";
-  }
-
-  function scanFramesWithInfo(label = "MEM44") {
-    const frames = [];
-    const docs = [];
-    qsa("iframe").forEach((ifr) => {
-      const info = {
-        src:
-          ifr.getAttribute("src") ||
-          ifr?.contentWindow?.location?.href ||
-          "(inline/unknown)",
-        sameOrigin: false,
-        accessible: false,
-        textareaCount: 0,
-        editableCount: 0,
-        formCount: 0,
-      };
-      try {
-        const doc =
-          ifr.contentDocument ||
-          (ifr.contentWindow && ifr.contentWindow.document) ||
-          null;
-        if (doc && doc.nodeType === 9) {
-          info.sameOrigin = true;
-          info.accessible = true;
-          info.textareaCount = doc.querySelectorAll("textarea").length;
-          info.editableCount =
-            doc.querySelectorAll(CONTENTEDITABLE_SELECTOR).length;
-          info.formCount = doc.querySelectorAll("form").length;
-          frames.push(info);
-          docs.push({
-            doc,
-            win: doc.defaultView || doc.parentWindow || ifr.contentWindow || null,
-            frameInfo: info,
-            iframeEl: ifr,
-          });
-        } else {
-          info.sameOrigin = true;
-          frames.push(info);
-        }
-      } catch {
-        info.sameOrigin = false;
-        info.accessible = false;
-        frames.push(info);
-      }
-    });
-    if (frames.length > 0) {
-      console.debug(`[${label}] inputGate iframe scan`, frames);
-    }
-    return { frames, docs };
-  }
-
-  function describeNode(node) {
-    if (!node) return null;
-    return {
-      tag: node.tagName || "",
-      id: node.id || "",
-      className: node.className || "",
-    };
   }
 
   // mid候補: mid, member_id, member_id1
@@ -564,19 +312,11 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     }, true);
   }
 
-  // checkWindow 経由で enqueue されたかどうかのフラグ
-  let __checkWindowEnqueued = false;
-
   function checkWindowLoadAutoTrigger() {
     const params = new URLSearchParams(location.search);
     const chk = params.get("checknumber") || "";
-    if (!chk) return false;
-    if (!window.opener) return false;
-
-    // v2.102: タブレジストリに即時登録（dispatcher が選べるようにする）
-    try { upsertMyTabRegistry(); } catch (e) { console.warn("[AutoTrigger] upsertMyTabRegistry error:", e); }
-    setTimeout(() => { try { upsertMyTabRegistry(); } catch {} }, 500); // 初期DOM遅延対策
-
+    if (!chk) return;
+    if (!window.opener) return;
     const key = getCheckWindowLoadKey();
     const now = Date.now();
 
@@ -589,7 +329,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
       const prevTab = String(prev?.tabId || "");
       if (prevTs && (now - prevTs) < OPEN_CHECK_TTL_MS && prevTab === TAB_ID) {
         console.log("[AutoTrigger] suppressed by TTL (same tab)", { key, ageMs: now - prevTs, TAB_ID });
-        return false;
+        return;
       }
     } catch (e) {
       // ignore parse errors
@@ -604,76 +344,15 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
         checknumber: chk,
       },
     });
-
     const myJobId = getMyJobId();
-
-    // v2.100: 既存ジョブの状態を確認
-    const queue = getQueue();
-    const existingJob = queue.items.find(it => it.jobId === myJobId);
-
-    if (existingJob) {
-      console.log("[AutoTrigger] job already exists:", myJobId, "status:", existingJob.status);
-
-      if (existingJob.status === "done") {
-        // done の場合は何もしない（正常完了済み）
-        console.log("[AutoTrigger] job already done, skipping");
-        __checkWindowEnqueued = true;
-        setStatus("完了", "#22c55e");
-        return true;
-      }
-
-      if (existingJob.status === "running") {
-        // running の場合は処理を待つ
-        console.log("[AutoTrigger] job is running, waiting...");
-        __checkWindowEnqueued = true;
-        setStatus("処理中…", "#ffa94d");
-        return true;
-      }
-
-      if (existingJob.status === "failed") {
-        // failed の場合は pending に戻してリトライ
-        console.log("[AutoTrigger] job failed, resetting to pending for retry");
-        existingJob.status = "pending";
-        existingJob.nextAt = Date.now();
-        existingJob.updatedAt = Date.now();
-        setQueue(queue);
-        updateProgressFromQueue();
-      }
-
-      // pending の場合はそのまま処理続行
-      __checkWindowEnqueued = true;
-      setStatus("処理中…", "#ffa94d");
-      setDiagStatus("auto: checkWindow (existing)", "#c084fc");
-      checkAndProcessMyJob();
-      return true;
-    }
-
-    // 新規 enqueue を試みる
     const enqueued = enqueueJob(myJobId, location.href);
     if (enqueued) {
-      console.log("[AutoTrigger] checkWindow enqueue SUCCESS", { jobId: myJobId });
-      setDiagStatus("auto: checkWindow", "#c084fc");
-      setStatus("処理中…", "#ffa94d");
+      console.log("[AutoTrigger] enqueue requested", { jobId: myJobId });
+      setDiagStatus("auto: start", "#c084fc");
       updateProgressFromQueue();
       checkAndProcessMyJob();
-      __checkWindowEnqueued = true;
-      return true;
     } else {
-      // v2.100: enqueue できなかった場合（queue too large or too many active）
-      // deferred に追加済みなので、ステータス表示を更新
-      const deferred = getDeferredJobs();
-      const inDeferred = deferred.some(j => j.jobId === myJobId);
-      if (inDeferred) {
-        console.log("[AutoTrigger] job added to deferred, waiting for queue space", { jobId: myJobId });
-        setDiagStatus("auto: deferred", "#f59e0b");
-        setStatus("後続待ち", "#f59e0b");
-      } else {
-        console.log("[AutoTrigger] enqueue failed for unknown reason", { jobId: myJobId });
-        setStatus("処理中…", "#ffa94d");
-      }
-      __checkWindowEnqueued = true;
-      // dispatcher が動いていれば deferred が処理される
-      return true;
+      console.log("[AutoTrigger] enqueue skipped", { reason: "exists or blocked", jobId: myJobId });
     }
   }
 
@@ -720,148 +399,18 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     }
   }
 
-  // v2.100: deferredJobs 管理
-  function getDeferredJobs() {
-    try {
-      const raw = localStorage.getItem(DEFERRED_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch { return []; }
-  }
-  function setDeferredJobs(jobs) {
-    try {
-      localStorage.setItem(DEFERRED_KEY, JSON.stringify(jobs));
-    } catch (e) {
-      console.warn("[ChatOps] setDeferredJobs error:", e);
-    }
-  }
-  function addDeferredJob(jobId, url) {
-    const deferred = getDeferredJobs();
-    if (deferred.some(j => j.jobId === jobId)) {
-      console.log("[ChatOps] job already in deferred:", jobId);
+  // ジョブ登録（二重登録防止）
+  function enqueueJob(jobId, url) {
+    const queue = getQueue();
+    if (queue.items.length >= QUEUE_LIMIT) {
+      console.log("[ChatOps] enqueue blocked: queue too large", { queueLen: queue.items.length });
       return false;
     }
-    deferred.push({ jobId, url, addedAt: Date.now() });
-    setDeferredJobs(deferred);
-    console.log("[ChatOps] added to deferred:", jobId, "deferredLen:", deferred.length);
-    return true;
-  }
-  function removeDeferredJob(jobId) {
-    const deferred = getDeferredJobs();
-    const filtered = deferred.filter(j => j.jobId !== jobId);
-    if (filtered.length !== deferred.length) {
-      setDeferredJobs(filtered);
-      return true;
-    }
-    return false;
-  }
-  function clearDeferredJobs() {
-    try { localStorage.removeItem(DEFERRED_KEY); } catch {}
-  }
-
-  // v2.105: アクティブジョブ数（開いているタブがあるものだけ）
-  // - running でもタブが閉じられていたら孤児扱いにしてカウントしない
-  // - pending は「開いているタブがある pending」のみカウント
-  function getActiveJobCount() {
-    const queue = getQueue();
-    return queue.items.filter(it =>
-      (it.status === "running" && isJobOpenSomewhere(it.jobId)) ||
-      (it.status === "pending" && isJobOpenSomewhere(it.jobId))
-    ).length;
-  }
-
-  // v2.104: 開いているタブが無い pending を掃除（タブレジストリ方式の副作用対策）
-  function pruneOrphanPendingJobs() {
-    const queue = getQueue();
-    const now = Date.now();
-    let removed = 0;
-
-    const keep = [];
-    for (const it of (queue.items || [])) {
-      if (it.status === "pending" && !isJobOpenSomewhere(it.jobId)) {
-        const age = now - (it.updatedAt || it.nextAt || now);
-        if (age >= ORPHAN_PENDING_TTL_MS) {
-          removed++;
-          continue;
-        }
-      }
-      keep.push(it);
-    }
-
-    if (removed > 0) {
-      queue.items = keep;
-      setQueue(queue);
-      updateProgressFromQueue();
-      console.warn("[Queue] pruned orphan pending jobs", { removed });
-    }
-
-    return removed;
-  }
-
-  // v2.105: 開いているタブが無い running を掃除（クラッシュ/強制終了/タイムアウト対策）
-  // 方針: ORPHAN_RUNNING_TTL_MS 経過した running を pending に戻して再ディスパッチ可能にする。
-  function pruneOrphanRunningJobs() {
-    const queue = getQueue();
-    const now = Date.now();
-    let recovered = 0;
-
-    for (const it of (queue.items || [])) {
-      if (it.status === "running" && !isJobOpenSomewhere(it.jobId)) {
-        const age = now - (it.updatedAt || it.nextAt || now);
-        if (age >= ORPHAN_RUNNING_TTL_MS) {
-          it.status = "pending";
-          it.nextAt = now + 1000; // すぐ再試行
-          it.updatedAt = now;
-          it.lastError = it.lastError || "orphan running recovered";
-          recovered++;
-        }
-      }
-    }
-
-    if (recovered > 0) {
-      setQueue(queue);
-      // currentJobId が孤児だった場合もクリア
-      try {
-        const prog = getProgress();
-        if (prog?.currentJobId && !isJobOpenSomewhere(prog.currentJobId)) {
-          prog.currentJobId = null;
-          setProgress(prog);
-        }
-      } catch {}
-      updateProgressFromQueue();
-      console.warn("[Queue] recovered orphan running jobs", { recovered });
-    }
-
-    return recovered;
-  }
-
-  // ジョブ登録（二重登録防止）- v2.100: deferred 対応
-  function enqueueJob(jobId, url, force = false) {
-    const queue = getQueue();
-
-    // 既に存在するか確認
     const exists = queue.items.find(it => it.jobId === jobId);
     if (exists) {
       console.log("[ChatOps] job already exists:", jobId, exists.status);
       return false;
     }
-
-    // v2.100: キュー上限チェック
-    if (queue.items.length >= QUEUE_LIMIT && !force) {
-      console.log("[ChatOps] enqueue blocked: queue too large", { queueLen: queue.items.length, QUEUE_LIMIT });
-      // deferred に追加
-      addDeferredJob(jobId, url);
-      return false;
-    }
-
-    // v2.100: アクティブジョブ数チェック
-    const activeCount = getActiveJobCount();
-    if (activeCount >= MAX_ACTIVE_JOBS && !force) {
-      console.log("[ChatOps] enqueue blocked: too many active jobs", { activeCount, MAX_ACTIVE_JOBS });
-      // deferred に追加
-      addDeferredJob(jobId, url);
-      return false;
-    }
-
     queue.items.push({
       jobId,
       url,
@@ -873,12 +422,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
       updatedAt: Date.now(),
     });
     setQueue(queue);
-    console.log("[ChatOps] enqueued:", jobId, "queueLen:", queue.items.length);
+    console.log("[ChatOps] enqueued:", jobId);
     updateProgressFromQueue();
-
-    // deferred から削除（念のため）
-    removeDeferredJob(jobId);
-
     return true;
   }
 
@@ -1003,7 +548,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
 
   // ディスパッチャ: 次の pending ジョブを currentJobId にセット
   let dispatcherTimer = null;
-  function startDispatcher(forceLog = false) {
+  function startDispatcher() {
     if (dispatcherTimer) return;
     console.log("[Queue] dispatcher started");
 
@@ -1013,44 +558,24 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
         return;
       }
       const progress = getProgress();
-
-      // v2.100: lastActivity を更新
-      __lastProgressActivity = Date.now();
-
       // currentJobId が設定済みでまだ running なら待つ
       if (progress.currentJobId) {
         const queue = getQueue();
         const current = queue.items.find(it => it.jobId === progress.currentJobId);
-
-        // v2.105: currentJobId が孤児（タブが無い）なら即クリアして詰まり回避
-        if (progress.currentJobId && !isJobOpenSomewhere(progress.currentJobId)) {
-          progress.currentJobId = null;
-        } else if (current && current.status === "running") {
+        if (current && current.status === "running") {
           return; // 処理中
-        } else {
-          // done/failed/存在しない → 次へ
-          progress.currentJobId = null;
         }
+        // done/failed なら次へ
+        progress.currentJobId = null;
       }
-      // 次の pending を探す（v2.102: オープン中のタブの jobId のみ対象）
+      // 次の pending を探す
       const queue = getQueue();
       const now = Date.now();
-
-      // v2.103: タブレジストリを prune（保存は heartbeat 側が担う）
-      const reg = pruneTabRegistry(getTabRegistry());
-
-      // v2.102: pending かつ nextAt が来ていて、かつ開いているタブがある jobId のみ
-      const next = queue.items.find(it =>
-        it.status === "pending"
-        && (!it.nextAt || it.nextAt <= now)
-        && isJobOpenSomewhere(it.jobId)
-      );
-
+      const next = queue.items.find(it => it.status === "pending" && (!it.nextAt || it.nextAt <= now));
       if (next) {
         progress.currentJobId = next.jobId;
-        progress.lastActivity = now; // v2.100: watchdog 用
         setProgress(progress);
-        console.log("[Queue] dispatching job:", next.jobId, "(tab open)");
+        console.log("[Queue] dispatching job:", next.jobId);
 
         // NOTE: 同一タブ内で setProgress しても storage イベントは発火しないため
         // dispatcher 自身がワーカー処理を起動する
@@ -1062,168 +587,16 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
           }
         }, 0);
       } else {
-        // v2.102: pending があるが open tab がない場合は詰まり検知ログ
-        const pendingJobs = queue.items.filter(it => it.status === "pending");
-        if (pendingJobs.length > 0) {
-          const openTabCount = Object.keys(reg.tabs).length;
-          console.log("[Queue] pending exists but no open tab for jobs", {
-            pendingCount: pendingJobs.length,
-            openTabCount,
-            pendingJobIds: pendingJobs.slice(0, 5).map(it => it.jobId),
-          });
-          // v2.104: 開いているタブが無い pending を掃除して詰まりを解除
-          pruneOrphanPendingJobs();
-          // v2.105: running 側も孤児回復
-          pruneOrphanRunningJobs();
-        }
-        // 全部終わり or 開いているタブがない
+        // 全部終わり
         if (progress.currentJobId) {
           progress.currentJobId = null;
           setProgress(progress);
         }
-        // v2.100: キューが空なら deferred をドレイン
-        drainDeferredJobsIfPossible();
-        // v2.100: 完全に終了したらクリーンアップ
-        cleanupIfAllDone();
       }
     };
 
     dispatch();
     dispatcherTimer = setInterval(dispatch, DISPATCH_INTERVAL_MS);
-    // v2.100: watchdog を開始
-    startWatchdog();
-  }
-
-  // v2.100: deferred jobs を空きがあれば enqueue（1件ずつ安全に）
-  function drainDeferredJobsIfPossible() {
-    console.log("[Drain] start");
-
-    const deferred = getDeferredJobs();
-    if (deferred.length === 0) {
-      console.log("[Drain] done (no deferred jobs)");
-      return;
-    }
-
-    // キューがビジーなら待つ
-    if (workerActive || inFlight) {
-      console.log("[Drain] skipped (queue busy)", { workerActive, inFlight });
-      return;
-    }
-
-    const queue = getQueue();
-    const activeCount = getActiveJobCount();
-
-    // 空きがなければ待つ
-    if (queue.items.length >= QUEUE_LIMIT || activeCount >= MAX_ACTIVE_JOBS) {
-      console.log("[Drain] skipped (no slots)", { queueLen: queue.items.length, activeCount });
-      return;
-    }
-
-    // 1件だけ取り出して enqueue
-    const job = deferred[0];
-    if (!job) {
-      console.log("[Drain] done (no deferred jobs)");
-      return;
-    }
-
-    const ok = enqueueJob(job.jobId, job.url, true); // force=true
-    if (ok) {
-      removeDeferredJob(job.jobId);
-      const remaining = getDeferredJobs().length;
-      console.log("[Drain] enqueue 1 job, remain=" + remaining, { jobId: job.jobId });
-    } else {
-      console.log("[Drain] enqueue failed", { jobId: job.jobId });
-    }
-  }
-
-  // v2.100: 完了後のクリーンアップ
-  function cleanupIfAllDone() {
-    const queue = getQueue();
-    const deferred = getDeferredJobs();
-    const pendingOrRunning = queue.items.filter(it => it.status === "pending" || it.status === "running").length;
-
-    if (pendingOrRunning === 0 && deferred.length === 0) {
-      console.log("[Queue] all jobs done, cleaning up");
-      try { localStorage.removeItem(LOCK_KEY); } catch {}
-      try { localStorage.removeItem(PROGRESS_KEY); } catch {}
-      setStatus("待機中", "#9aa");
-      stopWatchdog();
-    }
-  }
-
-  // v2.100: Watchdog - stale lock 自動回復
-  function startWatchdog() {
-    if (__watchdogTimer) return;
-    console.log("[Watchdog] started");
-
-    __watchdogTimer = setInterval(() => {
-      const progress = getProgress();
-      const queue = getQueue();
-      const now = Date.now();
-
-      // running ジョブがあるか確認
-      const runningJobs = queue.items.filter(it => it.status === "running");
-      if (runningJobs.length === 0) {
-        __lastProgressActivity = now;
-        return;
-      }
-
-      // lastActivity から WATCHDOG_STALE_MS 以上経過しているか
-      const lastActivity = progress.lastActivity || __lastProgressActivity;
-      const staleDuration = now - lastActivity;
-
-      if (staleDuration > WATCHDOG_STALE_MS) {
-        console.warn("[Watchdog] stale lock detected! staleDuration:", staleDuration, "ms, running jobs:", runningJobs.length);
-        recoverStaleQueue();
-      }
-    }, WATCHDOG_INTERVAL_MS);
-  }
-
-  function stopWatchdog() {
-    if (__watchdogTimer) {
-      clearInterval(__watchdogTimer);
-      __watchdogTimer = null;
-      console.log("[Watchdog] stopped");
-    }
-  }
-
-  function recoverStaleQueue() {
-    console.log("[Watchdog] recovering stale queue...");
-
-    // 1. running ジョブを pending に戻す
-    const queue = getQueue();
-    let recovered = 0;
-    for (const item of queue.items) {
-      if (item.status === "running") {
-        item.status = "pending";
-        item.tries = (item.tries || 0) + 1;
-        item.nextAt = Date.now() + 1000; // 1秒後に再試行
-        item.updatedAt = Date.now();
-        recovered++;
-      }
-    }
-    if (recovered > 0) {
-      setQueue(queue);
-      console.log("[Watchdog] recovered", recovered, "stale jobs");
-    }
-
-    // 2. lock と progress をクリア
-    try { localStorage.removeItem(LOCK_KEY); } catch {}
-    try { localStorage.removeItem(PROGRESS_KEY); } catch {}
-
-    // 3. progress を再設定
-    setProgress({ currentJobId: null, total: 0, done: 0, running: 0, failed: 0, remaining: 0, lastActivity: Date.now() });
-    __lastProgressActivity = Date.now();
-
-    // 4. dispatcher を再起動
-    if (dispatcherTimer) {
-      clearInterval(dispatcherTimer);
-      dispatcherTimer = null;
-    }
-    console.log("[Watchdog] restarting dispatcher...");
-    setTimeout(() => startDispatcher(true), 500);
-
-    console.log("[Watchdog] recovered stale queue");
   }
 
   // ワーカー: currentJobId が自分の jobId なら処理
@@ -1260,7 +633,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
             await sleep(delay);
           }
 
-          const payload = await buildWebhookPayload();
+          const payload = await buildWebhookPayload(false);  // 初回生成（temperature省略）
           setDiagStatus("queue: sending", "#38bdf8");
           const res = await sendToN8n(payload, "queue_auto");
 
@@ -1649,8 +1022,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
         <textarea id="n8n_prompt" rows="3" placeholder="例）もう少し丁寧に" style="width:100%;resize:vertical;border-radius:8px;border:1px solid #444;background:#1b1b1b;color:#eee;padding:8px;"></textarea>
         <div style="display:flex;align-items:center;gap:8px;">
           <span style="font-size:12px;color:#aaa;">温度</span>
-          <input id="n8n_temp" type="range" min="0" max="2.0" step="0.1" value="0.7" style="flex:1;">
-          <span id="n8n_temp_val" style="width:40px;text-align:right;font-size:12px;color:#ccc;">0.7</span>
+          <input id="n8n_temp" type="range" min="0" max="2.0" step="0.1" value="1.0" style="flex:1;">
+          <span id="n8n_temp_val" style="width:40px;text-align:right;font-size:12px;color:#ccc;">1.0</span>
         </div>
         <div style="display:flex;gap:8px;">
           <button id="n8n_send" style="flex:1;background:#16a34a;border:none;color:#fff;border-radius:8px;padding:10px 12px;font-weight:700;cursor:pointer;">再生成</button>
@@ -2099,7 +1472,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     // デバッグログ
     const maleCount = all.filter((m) => m.speaker === "male").length;
     const femaleCount = all.filter((m) => m.speaker === "female").length;
-    console.log("[MEM44] scrapeConversationStructured:", {
+    console.debug("[MEM44 v2.95] scrapeConversationStructured:", {
       total: all.length,
       male: maleCount,
       female: femaleCount,
@@ -2584,149 +1957,59 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
   }
 
   /** ===== 返信欄 ===== */
-  function pickReplyTarget(label = "MEM44") {
-    const frameScan = scanFramesWithInfo(label);
-    const docEntries = [
-      { doc: document, win: window, frameInfo: null, viaIframe: false },
-      ...frameScan.docs.map((d) => ({
-        doc: d.doc,
-        win: d.win || window,
-        frameInfo: d.frameInfo,
-        viaIframe: true,
-      })),
-    ];
+  function pickReplyTextarea() {
+    const sendBtn = qsa('input[type="submit"],button').find((b) =>
+      /送信して閉じる/.test(b.value || b.textContent || "")
+    );
+    const form = sendBtn ? sendBtn.closest("form") || null : null;
 
-    const candidates = [];
-
-    const pushCandidate = (el, ctx, formBound, distance) => {
-      if (!el || !ctx?.doc) return;
-      const targetType =
-        (el.tagName || "").toUpperCase() === "TEXTAREA" ? "textarea" : "contenteditable";
-      const dist = Number.isFinite(distance) ? distance : 999999;
-      candidates.push({
-        el,
-        doc: ctx.doc,
-        win: ctx.win || ctx.doc.defaultView || window,
-        viaIframe: !!ctx.viaIframe,
-        frameInfo: ctx.frameInfo || null,
-        formBound: !!formBound,
-        targetType,
-        distance: dist,
-      });
-    };
-
-    const calcDistance = (a, b) => {
-      if (!a || !b || !a.getBoundingClientRect || !b.getBoundingClientRect) return null;
-      const ra = a.getBoundingClientRect();
-      const rb = b.getBoundingClientRect();
-      return Math.hypot(
-        (ra.left + ra.right) / 2 - (rb.left + rb.right) / 2,
-        ra.bottom - rb.top
+    if (form) {
+      const direct = form.querySelector(
+        'textarea[name*="message" i], textarea[id*="message" i]'
       );
-    };
-
-    for (const ctx of docEntries) {
-      const { doc } = ctx;
-      if (!doc) continue;
-      const sendBtn = qsa('input[type="submit"],button', doc).find((b) =>
-        /送信して閉じる/.test(b.value || b.textContent || "")
-      );
-      const form = sendBtn ? sendBtn.closest("form") || null : null;
-
-      if (form) {
-        const formTargets = [
-          ...qsa('textarea[name*="message" i], textarea[id*="message" i]', form),
-          ...qsa(CONTENTEDITABLE_SELECTOR, form),
-          ...qsa("textarea", form),
-        ];
-        if (formTargets.length) {
-          const el = formTargets[0];
-          pushCandidate(el, ctx, true, calcDistance(el, sendBtn));
-        }
-      }
-
-      const controls = [
-        ...qsa("textarea", doc),
-        ...qsa(CONTENTEDITABLE_SELECTOR, doc),
-      ];
-      if (controls.length) {
-        let el = controls[0];
-        if (sendBtn && controls.length > 1) {
-          el =
-            controls.reduce((best, cur) => {
-              const d = calcDistance(cur, sendBtn);
-              if (!best || (d != null && d < best.d)) return { el: cur, d };
-              return best;
-            }, null)?.el || el;
-        }
-        pushCandidate(el, ctx, false, calcDistance(el, sendBtn));
-      }
+      if (direct) return direct;
+      const t2 = [...form.querySelectorAll("textarea")][0];
+      if (t2) return t2;
     }
-
-    if (!candidates.length) {
-      inputGateState.lastTarget = null;
-      return null;
-    }
-
-    candidates.sort((a, b) => {
-      if (a.formBound !== b.formBound) return a.formBound ? -1 : 1;
-      if (a.targetType !== b.targetType)
-        return a.targetType === "textarea" ? -1 : 1;
-      if (a.viaIframe !== b.viaIframe) return a.viaIframe ? 1 : -1;
-      return a.distance - b.distance;
-    });
-
-    inputGateState.lastTarget = candidates[0];
-    return candidates[0];
+    const all = [...document.querySelectorAll("textarea")];
+    if (!all.length) return null;
+    if (!sendBtn) return all[0];
+    const sb = sendBtn.getBoundingClientRect();
+    return (
+      all.reduce((best, ta) => {
+        const r = ta.getBoundingClientRect();
+        const d = Math.hypot(
+          (r.left + r.right) / 2 - (sb.left + sb.right) / 2,
+          r.bottom - sb.top
+        );
+        return !best || d < best.d ? { el: ta, d } : best;
+      }, null)?.el || null
+    );
   }
 
   function insertReply(text) {
     if (!text) return false;
-    const target = pickReplyTarget();
-    if (!target || !target.el) return false;
-
-    const ta = target.el;
-    const ownerDoc = target.doc || ta.ownerDocument || document;
-    const ownerWin = target.win || ownerDoc.defaultView || window;
+    const ta = pickReplyTextarea();
+    if (!ta) return false;
 
     // C3: 改行保持のデバッグ（挿入前後で \n\n を確認）
-    const hasDoubleNewlineBefore = text.includes("\n\n");
-    console.debug("[MEM44] insertReply: hasDoubleNewline(before)=", hasDoubleNewlineBefore, ", len=", text.length, {
-      viaIframe: target.viaIframe,
-      targetType: target.targetType,
-    });
+    const hasDoubleNewlineBefore = text.includes('\n\n');
+    console.debug('[MEM44] insertReply: hasDoubleNewline(before)=', hasDoubleNewlineBefore, ', len=', text.length);
 
-    if (typeof ta.focus === "function") {
-      try {
-        ta.focus();
-      } catch {}
-    }
+    ta.focus();
+    // textarea.value に直接代入（innerText/textContent/innerHTML は使わない）
+    ta.value = text;
+    ["input", "change", "keyup"].forEach((ev) =>
+      ta.dispatchEvent(new Event(ev, { bubbles: true }))
+    );
 
-    if (target.targetType === "textarea") {
-      ta.value = text;
-    } else {
-      ta.innerText = text;
-    }
+    // C3: 挿入後の確認
+    const hasDoubleNewlineAfter = ta.value.includes('\n\n');
+    console.debug('[MEM44] insertReply: hasDoubleNewline(after)=', hasDoubleNewlineAfter, ', textarea.value.len=', ta.value.length);
 
-    const dispatch = (name) => {
-      try {
-        const evt = new ownerWin.Event(name, { bubbles: true });
-        ta.dispatchEvent(evt);
-      } catch {
-        try {
-          ta.dispatchEvent(new Event(name, { bubbles: true }));
-        } catch {}
-      }
-    };
-    ["input", "change", "keyup"].forEach(dispatch);
-
-    if (target.targetType === "textarea") {
-      const hasDoubleNewlineAfter = ta.value.includes("\n\n");
-      console.debug("[MEM44] insertReply: hasDoubleNewline(after)=", hasDoubleNewlineAfter, ", textarea.value.len=", ta.value.length);
-      try {
-        ta.selectionStart = ta.selectionEnd = ta.value.length;
-      } catch {}
-    }
+    try {
+      ta.selectionStart = ta.selectionEnd = ta.value.length;
+    } catch {}
     return true;
   }
 
@@ -2858,8 +2141,14 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
   }
 
   async function sendToN8n(payload, reason = "") {
+    // 同一タブ内ガード
     if (inFlight) {
       setStatus("送信中のため待機", "#f59e0b");
+      return null;
+    }
+    // タブ間ロック取得（n8n 空ボディ対策）
+    if (!await acquireN8nLock()) {
+      setStatus("他タブ送信中: タイムアウト", "#f87171");
       return null;
     }
     inFlight = true;
@@ -2903,6 +2192,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     } finally {
       inFlight = false;
       inFlightAt = 0;
+      releaseN8nLock();  // タブ間ロック解放
     }
   }
 
@@ -2948,7 +2238,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     return p;
   }
 
-  async function buildWebhookPayload() {
+  async function buildWebhookPayload(isRegenerate = false) {
     // 新しい構造化会話取得（クラス名だけで男女判定）
     const conv = scrapeConversationStructured();
 
@@ -2977,7 +2267,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     const timestampMs = now.getTime();
 
     // デバッグ用ログ
-    console.log("[MEM44] buildWebhookPayload:", {
+    console.debug("[MEM44 v2.95] buildWebhookPayload:", {
       blueStage,
       conv6Count: conv6.length,
       conv20Count: conv20.length,
@@ -2995,13 +2285,16 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     const promptEl = qs("#n8n_prompt");
     const tempVal = tempEl ? parseFloat(tempEl.value) : NaN;
     const promptVal = promptEl ? promptEl.value.trim() : "";
-    const temperature = Number.isFinite(tempVal) ? tempVal : null;
+    // 初回生成: temperatureはpayloadに含めない（n8n側でデフォルト1.0を使用）
+    // 再生成: UIスライダーの値をpayloadに含める
+    // 再生成時のみtemperatureを含める（それ以外はundefined → n8nでデフォルト1.0）
+    const temperature = isRegenerate && Number.isFinite(tempVal) ? tempVal : undefined;
     const oneLinerPrompt = promptVal || null;
+    // regenerateフラグ
+    const regenerate = isRegenerate;
 
-    // デバッグ（初回のみ）
-    if (temperature !== null || oneLinerPrompt) {
-      console.debug("[MEM44] payload extras: temp=", temperature, "oneLiner=", oneLinerPrompt?.slice(0, 30));
-    }
+    // デバッグ
+    console.debug("[MEM44] payload extras: regenerate=", regenerate, "temp=", temperature, "oneLiner=", oneLinerPrompt?.slice(0, 30));
 
     // FIX C: tzOffsetMin + localHour を追加（時間帯ズレ対策）
     // getTimezoneOffset() は「UTCとの差(分)で西が+」なので符号反転
@@ -3026,6 +2319,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
       allowedEmojis,
       temperature,
       oneLinerPrompt,
+      regenerate,
     };
   }
 
@@ -3040,8 +2334,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
       return;
     }
     try {
-      const payload = await buildWebhookPayload();
-      console.log("[MEM44] sending payload to n8n:", payload.timestamp, payload);
+      const payload = await buildWebhookPayload(true);  // 再生成（UIスライダーのtemperatureを使用）
+      console.log("[MEM44 v2.95] sending payload to n8n:", payload.timestamp, payload);
       const res = await sendToN8n(payload);
       if (!res) return;
       // reply_formatted を優先使用（文頭制御・疑問文化・改行整形済み）
@@ -3167,15 +2461,9 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     // 既にキューにある自分のジョブをチェック
     checkAndProcessMyJob();
 
-    // checkWindow 経由で既に enqueue された場合はガードを回避
-    if (!AUTO_SEND_ON_LOAD && !__checkWindowEnqueued) {
+    if (!AUTO_SEND_ON_LOAD) {
       log("auto-send disabled: not enqueueing (manual send only)");
       setStatus("待機中", "#9aa");
-      return;
-    }
-    // checkWindow 経由の場合はここまで来てもOK（既に enqueue 済み）
-    if (__checkWindowEnqueued) {
-      log("checkWindow enqueue already done - continuing with dispatcher");
       return;
     }
 
@@ -3219,159 +2507,8 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     }, 500);
   }
 
-    /** ===== DOM Ready Gates ===== */
-  function waitForUiGate(initFn, label = "MEM44") {
-    let started = false;
-    let fired = false;
-    const pollMs = 300;
-    const timeoutMs = 20000;
-
-    const cleanup = (observer, intervalId) => {
-      if (intervalId) clearInterval(intervalId);
-      if (observer) observer.disconnect();
-    };
-
-    const snapshot = () => {
-      const rootOk = !!getChatRoot();
-      return {
-        readyState: document.readyState,
-        iframeCount: document.querySelectorAll("iframe").length,
-        hasChatRoot: rootOk,
-      };
-    };
-
-    const tryReady = (observer, intervalId) => {
-      if (fired) return;
-      const snap = snapshot();
-      const ok = snap.readyState !== "loading" && snap.hasChatRoot;
-      if (!ok) return;
-      fired = true;
-      cleanup(observer, intervalId);
-      console.log(`[${label}] uiGate ready`, snap);
-      Promise.resolve()
-        .then(() => initFn && initFn())
-        .catch((e) => console.warn(`[${label}] uiGate init error`, e));
-    };
-
-    const observer = new MutationObserver(() => tryReady(observer, intervalId));
-    const root = document.body || document.documentElement;
-    if (root) observer.observe(root, { childList: true, subtree: true });
-    const intervalId = setInterval(() => tryReady(observer, intervalId), pollMs);
-    setTimeout(() => {
-      if (!fired) {
-        const snap = snapshot();
-        console.warn(`[${label}] uiGate timeout`, snap);
-        if (intervalId) clearInterval(intervalId);
-      }
-    }, timeoutMs);
-
-    if (!started) {
-      started = true;
-      const snap = snapshot();
-      console.log(`[${label}] uiGate start`, snap);
-    }
-
-    tryReady(observer, intervalId);
-  }
-
-  function waitForInputGate(startFn, label = "MEM44") {
-    let fired = false;
-    inputGateState.ready = false;
-    const pollMs = 400;
-    const timeoutMs = 15000;
-    const observers = [];
-    const observedDocs = new WeakSet();
-    const frameLoadListeners = [];
-
-    const cleanup = () => {
-      observers.forEach((o) => o.disconnect());
-      frameLoadListeners.forEach(({ iframe, handler }) => {
-        try {
-          iframe.removeEventListener("load", handler, true);
-        } catch {}
-      });
-    };
-
-    const attachObserver = (doc) => {
-      if (!doc || observedDocs.has(doc)) return;
-      const root = doc.body || doc.documentElement;
-      if (!root) return;
-      const obs = new MutationObserver(() => tryReady("mutation"));
-      obs.observe(root, { childList: true, subtree: true, attributes: true });
-      observers.push(obs);
-      observedDocs.add(doc);
-    };
-
-    const attachFrameLoad = (iframe) => {
-      if (!iframe || iframe.dataset?.inputGateLoadAttached === "1") return;
-      const handler = () => tryReady("iframe-load");
-      iframe.addEventListener("load", handler, true);
-      iframe.dataset.inputGateLoadAttached = "1";
-      frameLoadListeners.push({ iframe, handler });
-    };
-
-    const snapshot = () => {
-      const frameScan = scanFramesWithInfo(label);
-      frameScan.docs.forEach((d) => attachObserver(d.doc));
-      frameScan.docs.forEach((d) => attachFrameLoad(d.iframeEl));
-
-      const textareaCountDoc = document.querySelectorAll("textarea").length;
-      const editableCountDoc =
-        document.querySelectorAll(CONTENTEDITABLE_SELECTOR).length;
-      const formCountDoc = document.querySelectorAll("form").length;
-      const chatRoot = getChatRoot();
-      const target = pickReplyTarget(label);
-
-      const snap = {
-        readyState: document.readyState,
-        textareaCountDoc,
-        editableCountDoc,
-        formCountDoc,
-        iframeCount: frameScan.frames.length,
-        frames: frameScan.frames,
-        hasChatRoot: !!chatRoot,
-        chatRootHint: describeNode(chatRoot),
-        targetFound: !!target,
-        targetType: target?.targetType || null,
-        viaIframe: !!target?.viaIframe,
-      };
-      inputGateState.lastSnapshot = snap;
-      return snap;
-    };
-
-    const tryReady = (reason = "poll") => {
-      if (fired) return;
-      const snap = snapshot();
-      const ok =
-        document.readyState !== "loading" &&
-        snap.targetFound;
-      if (!ok) return;
-      fired = true;
-      inputGateState.ready = true;
-      cleanup();
-      console.log(`[${label}] inputGate ready`, { ...snap, reason });
-      Promise.resolve()
-        .then(() => startFn && startFn())
-        .catch((e) => console.warn(`[${label}] inputGate start error`, e));
-    };
-
-    attachObserver(document);
-    const intervalId = setInterval(() => tryReady("interval"), pollMs);
-    setTimeout(() => {
-      if (!fired) {
-        const snap = snapshot();
-        console.warn(`[${label}] inputGate timeout`, snap);
-        clearInterval(intervalId);
-        cleanup();
-      }
-    }, timeoutMs);
-
-    console.log(`[${label}] inputGate start`, snapshot());
-    tryReady("start");
-  }
-
   /** ===== Main ===== */
-  async function initUI() {
+  (async function init() {
     if (!isPersonalSendPage()) {
       log("skip: not personalbox");
       return;
@@ -3401,53 +2538,7 @@ console.log("MEM44 Auto-Reply AI Assistant v2.113 - inputGate via reply-target")
     watchPairMemoChanges();
     hookSendButtonAutoSave();
 
-    log("ready.");
-  }
-
-  function startAutomation() {
-    if (window.__chatopsAutomationStarted) {
-      log("skip: automation already started");
-      return;
-    }
-    window.__chatopsAutomationStarted = true;
-    if (!isPersonalSendPage()) {
-      log("skip: not personalbox (automation)");
-      return;
-    }
     mountAuto();
-  }
-
-  function exportDebug(label = "MEM44") {
-    const tgt = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-    const dbg = tgt.__datingopsDebug || {};
-    const api = {
-      snapshotInputGate: () => inputGateState.lastSnapshot || null,
-      snapshotChatRoot: () => {
-        const root = getChatRoot();
-        return root
-          ? { found: true, ...describeNode(root) }
-          : { found: false };
-      },
-      snapshotFrames: () => {
-        if (inputGateState.lastSnapshot?.frames) return inputGateState.lastSnapshot.frames;
-        return scanFramesWithInfo(label).frames;
-      },
-      pickReplyTargetDebug: () => {
-        const t = pickReplyTarget(label);
-        return {
-          found: !!t,
-          targetType: t?.targetType || null,
-          viaIframe: !!t?.viaIframe,
-          frameInfo: t?.frameInfo || null,
-        };
-      },
-    };
-    Object.assign(dbg, api);
-    tgt.__datingopsDebug = dbg;
-    window.__datingopsDebug = tgt.__datingopsDebug;
-  }
-
-  exportDebug("MEM44");
-  waitForUiGate(() => initUI(), "MEM44");
-  waitForInputGate(() => startAutomation(), "MEM44");
+    log("ready.");
+  })();
 })();
